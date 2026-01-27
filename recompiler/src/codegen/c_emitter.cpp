@@ -880,6 +880,10 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                                  emit_indent(); out << "    gb_tick(ctx, " << (int)inline_cycles << ");\n";
                                  emit_indent(); out << "    if (ctx->stopped) return;\n";
                             }
+                            
+                            // JUMP inlining requires executing the RET (pop) because we jumped to a function that returns
+                            emit_indent(); out << "    gb_ret(ctx);\n";
+                            
                             emit_indent(); out << "} /* End Inline */\n";
                         } else {
                             out << target_func << "(ctx);\n";
@@ -979,6 +983,10 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                              emit_indent(); out << "    gb_tick(ctx, " << (int)inline_cycles << ");\n";
                              emit_indent(); out << "    if (ctx->stopped) return;\n";
                         }
+                        
+                        // JUMP_CC inlining requires executing the RET (pop)
+                        emit_indent(); out << "    gb_ret(ctx);\n";
+
                         emit_indent(); out << "} /* End Inline */\n";
                     } else {
                         emit_indent(); out << "    " << target_func << "(ctx);\n";
@@ -1026,18 +1034,17 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
             } else {
                 std::string func_name = program.make_function_name(target_bank, target);
                 bool func_exists = program.functions.find(func_name) != program.functions.end();
+                bool did_inline = false;
 
-                out << "gb_push16(ctx, 0x" << std::hex << return_addr << std::dec << ");\n";
-                emit_indent(); out << "ctx->pc = 0x" << std::hex << target << std::dec << ";\n";
-                if (options.emit_cycle_counting && group_cycles > 0) {
-                    emit_indent(); out << "gb_tick(ctx, " << (int)group_cycles << ");\n";
-                    emit_indent(); out << "if (ctx->stopped) return;\n";
-                }
-                emit_indent();
-                
                 if (func_exists && inlineable_functions.count(func_name)) {
-                    // INLINE THE FUNCTION
-                    out << "/* Inline: " << func_name << " */ {\n";
+                     // INLINE THE FUNCTION
+                     // Emit ticks for group_cycles (CALL cost)
+                     if (options.emit_cycle_counting && group_cycles > 0) {
+                         emit_indent(); out << "gb_tick(ctx, " << (int)group_cycles << ");\n";
+                         emit_indent(); out << "if (ctx->stopped) return;\n";
+                     }
+
+                     out << "/* Inline: " << func_name << " */ {\n";
                     
                     const auto& func = program.functions.at(func_name);
                     const auto& block = program.blocks.at(func.block_ids[0]);
@@ -1066,11 +1073,26 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                          emit_indent(); out << "    if (ctx->stopped) return;\n";
                     }
                     
+                    // Manually update PC to return address (since RET was skipped)
+                    emit_indent(); out << "    ctx->pc = 0x" << std::hex << return_addr << std::dec << ";\n";
+                    
                     emit_indent(); out << "} /* End Inline */\n";
-                } else if (func_exists) {
-                    out << func_name << "(ctx);\n";
-                } else {
-                    // Fallback to dispatcher (implicit by return)
+                    did_inline = true;
+                }
+                
+                if (!did_inline) {
+                    out << "gb_push16(ctx, 0x" << std::hex << return_addr << std::dec << ");\n";
+                    emit_indent(); out << "ctx->pc = 0x" << std::hex << target << std::dec << ";\n";
+                    if (options.emit_cycle_counting && group_cycles > 0) {
+                        emit_indent(); out << "gb_tick(ctx, " << (int)group_cycles << ");\n";
+                        emit_indent(); out << "if (ctx->stopped) return;\n";
+                    }
+                    emit_indent();
+                    if (func_exists) {
+                        out << func_name << "(ctx);\n";
+                    } else {
+                        // Fallback to dispatcher (implicit by return)
+                    }
                 }
                 emit_indent();
                 out << "return;\n";
@@ -1100,17 +1122,20 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
             } else {
                 std::string func_name = program.make_function_name(target_bank, target);
                 bool func_exists = program.functions.find(func_name) != program.functions.end();
+                
+                int taken_cycles = instr.cycles_branch_taken;
 
                 out << "if (" << expr << ") {\n";
-                emit_indent(); out << "    gb_push16(ctx, 0x" << std::hex << return_addr << std::dec << ");\n";
-                emit_indent(); out << "    ctx->pc = 0x" << std::hex << target << std::dec << ";\n";
-                if (options.emit_cycle_counting) {
-                    emit_indent(); out << "    gb_tick(ctx, " << (int)instr.cycles_branch_taken << ");\n";
-                    emit_indent(); out << "    if (ctx->stopped) return;\n";
-                }
+                
+                bool did_inline = false;
                 if (func_exists && inlineable_functions.count(func_name)) {
-                    // INLINE THE FUNCTION
-                    out << "/* Inline: " << func_name << " */ {\n";
+                     // INLINE logic
+                     if (options.emit_cycle_counting) {
+                        emit_indent(); out << "    gb_tick(ctx, " << (int)taken_cycles << ");\n";
+                        emit_indent(); out << "    if (ctx->stopped) return;\n";
+                     }
+
+                     emit_indent(); out << "/* Inline: " << func_name << " */ {\n";
                     const auto& func = program.functions.at(func_name);
                     const auto& block = program.blocks.at(func.block_ids[0]);
                     
@@ -1123,16 +1148,29 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                         emit_ir_instruction(out, block.instructions[k], program, indent + 1, options, 0, 0, false, "", inlineable_functions);
                     }
                     if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
-
+ 
                     if (options.emit_cycle_counting) {
                          emit_indent(); out << "    gb_tick(ctx, " << (int)inline_cycles << ");\n";
                          emit_indent(); out << "    if (ctx->stopped) return;\n";
                     }
+                    
+                    // Manually update PC to return address
+                    emit_indent(); out << "    ctx->pc = 0x" << std::hex << return_addr << std::dec << ";\n";
+
                     emit_indent(); out << "} /* End Inline */\n";
-                } else if (func_exists) {
-                    emit_indent(); out << "    " << func_name << "(ctx);\n";
-                } else {
-                    // Fallback to dispatcher (implicit by return)
+                    did_inline = true;
+                }
+                
+                if (!did_inline) {
+                    emit_indent(); out << "    gb_push16(ctx, 0x" << std::hex << return_addr << std::dec << ");\n";
+                    emit_indent(); out << "    ctx->pc = 0x" << std::hex << target << std::dec << ";\n";
+                    if (options.emit_cycle_counting) {
+                        emit_indent(); out << "    gb_tick(ctx, " << (int)taken_cycles << ");\n";
+                        emit_indent(); out << "    if (ctx->stopped) return;\n";
+                    }
+                    if (func_exists) {
+                        emit_indent(); out << "    " << func_name << "(ctx);\n";
+                    }
                 }
                 emit_indent(); out << "    return;\n";
                 emit_indent(); out << "} /* " << cond << " */\n";
@@ -1607,6 +1645,8 @@ GeneratedOutput generate_output(const ir::Program& program,
                 }
                 if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
 
+                source_ss << "                    gb_ret(ctx);\n";
+
                 if (options.emit_cycle_counting) {
                      source_ss << "                    gb_tick(ctx, " << (int)inline_cycles << ");\n";
                      source_ss << "                    if (ctx->stopped) return;\n";
@@ -1634,6 +1674,8 @@ GeneratedOutput generate_output(const ir::Program& program,
                         emit_ir_instruction(source_ss, block.instructions[k], program, 6, options, 0, 0, false, "", inlineable_functions);
                     }
                     if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
+
+                    source_ss << "                        gb_ret(ctx);\n";
 
                     if (options.emit_cycle_counting) {
                          source_ss << "                        gb_tick(ctx, " << (int)inline_cycles << ");\n";
@@ -1810,6 +1852,8 @@ GeneratedOutput generate_output(const ir::Program& program,
                                     }
                                     if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
 
+                                    source_ss << "        gb_ret(ctx);\n";
+
                                     if (options.emit_cycle_counting) {
                                          source_ss << "        gb_tick(ctx, " << (int)inline_cycles << ");\n";
                                          source_ss << "        if (ctx->stopped) return;\n";
@@ -1960,6 +2004,14 @@ GeneratedOutput generate_output(const ir::Program& program,
     cmake_ss << "# Set C standard\n";
     cmake_ss << "set(CMAKE_C_STANDARD 11)\n";
     cmake_ss << "set(CMAKE_C_STANDARD_REQUIRED ON)\n\n";
+    cmake_ss << "# Aggressive optimization flags\n";
+    cmake_ss << "if(NOT CMAKE_BUILD_TYPE)\n";
+    cmake_ss << "    set(CMAKE_BUILD_TYPE Release)\n";
+    cmake_ss << "endif()\n";
+    cmake_ss << "if(CMAKE_C_COMPILER_ID MATCHES \"GNU|Clang\")\n";
+    cmake_ss << "    add_compile_options(-O3 -march=native -flto -funroll-loops)\n";
+    cmake_ss << "    add_link_options(-O3 -flto)\n";
+    cmake_ss << "endif()\n\n";
     // Calculate relative path to runtime
     namespace fs = std::filesystem;
     fs::path out_path(options.output_dir);
