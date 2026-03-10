@@ -47,9 +47,17 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value);
 void gb_audio_step(GBContext* ctx, uint32_t cycles);
 
 /**
- * @brief Reset Frame Sequencer (called on DIV write)
+ * @brief Advance frame-sequencer timing from DIV transitions
+ * @param old_div Divider value before the CPU step
+ * @param new_div Divider value after the CPU step
  */
-void gb_audio_div_reset(void* apu);
+void gb_audio_div_tick(void* apu, uint16_t old_div, uint16_t new_div);
+
+/**
+ * @brief Handle a write to DIV, including any APU clock edge it causes
+ * @param old_div Divider value before it was reset to 0
+ */
+void gb_audio_div_reset(void* apu, uint16_t old_div);
 
 /**
  * @brief Get current sample for left/right channels
@@ -64,6 +72,18 @@ void gb_audio_get_samples(void* apu, int16_t* left, int16_t* right);
  * @param enabled If true, capture audio to debug_audio.raw
  */
 void gb_audio_set_debug(bool enabled);
+
+/**
+ * @brief Configure debug capture length
+ * @param seconds Number of seconds to capture when debug audio is enabled
+ */
+void gb_audio_set_debug_capture_seconds(uint32_t seconds);
+
+/**
+ * @brief Enable/disable audio text tracing
+ * @param enabled If true, write APU activity to debug_audio_trace.log
+ */
+void gb_audio_set_debug_trace(bool enabled);
 
 #ifdef __cplusplus
 }

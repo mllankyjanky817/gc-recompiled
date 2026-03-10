@@ -9,15 +9,96 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /* Debug audio logging - now controlled by runtime flag */
 /* #define AUDIO_DEBUG_LOGGING */
+#define DEBUG_AUDIO_MAX_SAMPLES (44100 * 10) /* 10 seconds */
+#define DEBUG_AUDIO_BUFFER_FRAMES 2048
+
 static bool g_audio_debug_enabled = false;
+static bool g_audio_debug_trace_enabled = false;
+static FILE* g_debug_audio_file = NULL;
+static FILE* g_debug_audio_trace_file = NULL;
+static int g_debug_sample_count = 0;
+static int g_debug_capture_limit_samples = DEBUG_AUDIO_MAX_SAMPLES;
+static int16_t g_debug_audio_buffer[DEBUG_AUDIO_BUFFER_FRAMES * 2];
+static int g_debug_audio_buffer_count = 0;
+static uint64_t g_debug_trace_total_samples = 0;
+static uint32_t g_debug_trace_window_samples = 0;
+static uint32_t g_debug_trace_window_nonzero = 0;
+static uint32_t g_debug_trace_window_channel_nonzero[4] = {0};
+static int32_t g_debug_trace_window_peak = 0;
+static bool g_debug_trace_first_nonzero_logged = false;
+
+static void audio_debug_trace_log(const char* fmt, ...) {
+    if (!g_audio_debug_trace_enabled) return;
+
+    if (!g_debug_audio_trace_file) {
+        g_debug_audio_trace_file = fopen("debug_audio_trace.log", "w");
+        if (!g_debug_audio_trace_file) return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(g_debug_audio_trace_file, fmt, args);
+    va_end(args);
+    fflush(g_debug_audio_trace_file);
+}
+
+static void audio_debug_capture_flush(void) {
+    if (!g_debug_audio_file || g_debug_audio_buffer_count == 0) return;
+    fwrite(g_debug_audio_buffer, sizeof(int16_t), (size_t)g_debug_audio_buffer_count * 2, g_debug_audio_file);
+    g_debug_audio_buffer_count = 0;
+}
+
+static void audio_debug_capture_reset(void) {
+    audio_debug_capture_flush();
+    if (g_debug_audio_file) {
+        fclose(g_debug_audio_file);
+        g_debug_audio_file = NULL;
+    }
+    g_debug_sample_count = 0;
+    g_debug_audio_buffer_count = 0;
+    g_debug_trace_total_samples = 0;
+    g_debug_trace_window_samples = 0;
+    g_debug_trace_window_nonzero = 0;
+    memset(g_debug_trace_window_channel_nonzero, 0, sizeof(g_debug_trace_window_channel_nonzero));
+    g_debug_trace_window_peak = 0;
+    g_debug_trace_first_nonzero_logged = false;
+    if (g_debug_audio_trace_file) {
+        fclose(g_debug_audio_trace_file);
+        g_debug_audio_trace_file = NULL;
+    }
+}
 
 void gb_audio_set_debug(bool enabled) {
+    if (enabled != g_audio_debug_enabled) {
+        audio_debug_capture_reset();
+    }
     g_audio_debug_enabled = enabled;
     if (enabled) {
         printf("[AUDIO] Debug audio capture enabled\n");
+    }
+}
+
+void gb_audio_set_debug_capture_seconds(uint32_t seconds) {
+    if (seconds == 0) {
+        g_debug_capture_limit_samples = DEBUG_AUDIO_MAX_SAMPLES;
+    } else {
+        uint64_t sample_limit = (uint64_t)seconds * 44100ULL;
+        if (sample_limit > 0x7fffffffULL) sample_limit = 0x7fffffffULL;
+        g_debug_capture_limit_samples = (int)sample_limit;
+    }
+}
+
+void gb_audio_set_debug_trace(bool enabled) {
+    if (enabled != g_audio_debug_trace_enabled) {
+        audio_debug_capture_reset();
+    }
+    g_audio_debug_trace_enabled = enabled;
+    if (enabled) {
+        printf("[AUDIO] Debug audio trace enabled\n");
     }
 }
 
@@ -125,6 +206,12 @@ typedef struct GBAudio {
     /* 4194304 Hz / 44100 Hz = 95.108... cycles per sample */
     /* We use 16.16 fixed point: 95.108 * 65536 = 6233460 */
     uint32_t sample_timer_fixed;
+
+    /* Simple DC-blocker state for the final stereo mix */
+    int32_t hp_prev_in_l;
+    int32_t hp_prev_in_r;
+    int32_t hp_prev_out_l;
+    int32_t hp_prev_out_r;
     
 } GBAudio;
 
@@ -132,9 +219,53 @@ typedef struct GBAudio {
  * Internal Helpers
  * ========================================================================== */
 
-static FILE* g_debug_audio_file = NULL;
-static int g_debug_sample_count = 0;
-#define DEBUG_AUDIO_MAX_SAMPLES (44100 * 10) /* 10 seconds */
+static const char* audio_reg_name(uint16_t addr) {
+    switch (addr) {
+        case 0xFF10: return "NR10";
+        case 0xFF11: return "NR11";
+        case 0xFF12: return "NR12";
+        case 0xFF13: return "NR13";
+        case 0xFF14: return "NR14";
+        case 0xFF16: return "NR21";
+        case 0xFF17: return "NR22";
+        case 0xFF18: return "NR23";
+        case 0xFF19: return "NR24";
+        case 0xFF1A: return "NR30";
+        case 0xFF1B: return "NR31";
+        case 0xFF1C: return "NR32";
+        case 0xFF1D: return "NR33";
+        case 0xFF1E: return "NR34";
+        case 0xFF20: return "NR41";
+        case 0xFF21: return "NR42";
+        case 0xFF22: return "NR43";
+        case 0xFF23: return "NR44";
+        case 0xFF24: return "NR50";
+        case 0xFF25: return "NR51";
+        case 0xFF26: return "NR52";
+        default: return "WAVE";
+    }
+}
+
+static void audio_debug_dump_state(GBContext* ctx, GBAudio* apu, const char* reason) {
+    if (!g_audio_debug_trace_enabled) return;
+    audio_debug_trace_log(
+        "[STATE] cyc=%u reason=%s "
+        "nr50=%02X nr51=%02X nr52=%02X "
+        "| ch1 en=%d len=%d vol=%d duty=%d freq=%u pos=%d "
+        "| ch2 en=%d len=%d vol=%d duty=%d freq=%u pos=%d "
+        "| ch3 en=%d len=%d level=%u freq=%u pos=%d "
+        "| ch4 en=%d len=%d vol=%d poly=%02X lfsr=%04X\n",
+        ctx ? ctx->cycles : 0,
+        reason ? reason : "-",
+        apu->nr50, apu->nr51, apu->nr52,
+        apu->ch1.enabled, apu->ch1.length_counter, apu->ch1.volume, (apu->ch1.nr11 >> 6) & 3,
+        apu->ch1.nr13 | ((apu->ch1.nr14 & 0x07) << 8), apu->ch1.wave_pos,
+        apu->ch2.enabled, apu->ch2.length_counter, apu->ch2.volume, (apu->ch2.nr21 >> 6) & 3,
+        apu->ch2.nr23 | ((apu->ch2.nr24 & 0x07) << 8), apu->ch2.wave_pos,
+        apu->ch3.enabled, apu->ch3.length_counter, (apu->ch3.nr32 >> 5) & 3,
+        apu->ch3.nr33 | ((apu->ch3.nr34 & 0x07) << 8), apu->ch3.wave_pos,
+        apu->ch4.enabled, apu->ch4.length_counter, apu->ch4.volume, apu->ch4.nr43, apu->ch4.lfsr);
+}
 
 static const uint8_t DUTY_CYCLES[4][8] = {
     {0, 0, 0, 0, 0, 0, 0, 1}, /* 12.5% */
@@ -176,6 +307,80 @@ static void step_envelope(int* timer, int* volume, uint8_t env_reg) {
     }
 }
 
+static void audio_reset_timing_state(GBAudio* apu) {
+    apu->fs_timer = 0;
+    /* Store the previously executed step so the next clock runs step 0. */
+    apu->fs_step = 7;
+    apu->sample_timer = 0;
+    apu->sample_timer_fixed = 0;
+}
+
+static void audio_clock_frame_sequencer(GBAudio* apu) {
+    apu->fs_step = (apu->fs_step + 1) & 7;
+
+    /* Step Length (256 Hz): Steps 0, 2, 4, 6 */
+    if ((apu->fs_step & 1) == 0) {
+        if (apu->ch1.length_enabled && apu->ch1.length_counter > 0) {
+            apu->ch1.length_counter--;
+            if (apu->ch1.length_counter == 0) apu->ch1.enabled = false;
+        }
+        if (apu->ch2.length_enabled && apu->ch2.length_counter > 0) {
+            apu->ch2.length_counter--;
+            if (apu->ch2.length_counter == 0) apu->ch2.enabled = false;
+        }
+        if (apu->ch3.length_enabled && apu->ch3.length_counter > 0) {
+            apu->ch3.length_counter--;
+            if (apu->ch3.length_counter == 0) apu->ch3.enabled = false;
+        }
+        if (apu->ch4.length_enabled && apu->ch4.length_counter > 0) {
+            apu->ch4.length_counter--;
+            if (apu->ch4.length_counter == 0) apu->ch4.enabled = false;
+        }
+    }
+
+    /* Step Sweep (128 Hz): Steps 2, 6 */
+    if (apu->fs_step == 2 || apu->fs_step == 6) {
+        Channel1* ch1 = &apu->ch1;
+        if (ch1->sweep_enabled && ch1->enabled) {
+            ch1->sweep_timer--;
+            if (ch1->sweep_timer <= 0) {
+                uint8_t period = (ch1->nr10 >> 4) & 0x07;
+                ch1->sweep_timer = (period == 0) ? 8 : period;
+
+                if (period > 0 && (ch1->nr10 & 0x07) > 0) {
+                    uint16_t new_freq = calc_sweep(ch1);
+                    if (new_freq <= 2047) {
+                        ch1->shadow_freq = new_freq;
+                        ch1->nr13 = new_freq & 0xFF;
+                        ch1->nr14 = (ch1->nr14 & ~0x07) | ((new_freq >> 8) & 0x07);
+                        if (calc_sweep(ch1) > 2047) ch1->enabled = false;
+                    } else {
+                        ch1->enabled = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Step Envelope (64 Hz): Step 7 */
+    if (apu->fs_step == 7) {
+        if (apu->ch1.enabled) step_envelope(&apu->ch1.env_timer, &apu->ch1.volume, apu->ch1.nr12);
+        if (apu->ch2.enabled) step_envelope(&apu->ch2.env_timer, &apu->ch2.volume, apu->ch2.nr22);
+        if (apu->ch4.enabled) step_envelope(&apu->ch4.env_timer, &apu->ch4.volume, apu->ch4.nr42);
+    }
+}
+
+static int16_t audio_apply_highpass(int32_t input, int32_t* prev_in, int32_t* prev_out) {
+    /* One-pole DC blocker using Q15 fixed point (R ~= 0.996) */
+    const int32_t HP_R = 32640;
+    int32_t output = input - *prev_in + (int32_t)(((int64_t)HP_R * *prev_out) >> 15);
+    *prev_in = input;
+    *prev_out = output;
+    if (output > 32767) return 32767;
+    if (output < -32768) return -32768;
+    return (int16_t)output;
+}
+
 /* ============================================================================
  * Public Interface
  * ========================================================================== */
@@ -192,12 +397,15 @@ void* gb_audio_create(void) {
 }
 
 void gb_audio_destroy(void* apu) {
+    audio_debug_capture_reset();
     free(apu);
 }
 
 void gb_audio_reset(void* apu_ptr) {
     GBAudio* apu = (GBAudio*)apu_ptr;
+    audio_debug_capture_reset();
     memset(apu, 0, sizeof(GBAudio));
+    audio_reset_timing_state(apu);
     apu->sample_period = 95;
     
     /* Initial Register Values (Standard DMG) */
@@ -223,6 +431,7 @@ void gb_audio_reset(void* apu_ptr) {
     apu->nr50 = 0x77;
     apu->nr51 = 0xF3;
     apu->nr52 = 0xF1; /* Audio ON */
+    audio_debug_dump_state(NULL, apu, "reset");
 }
 
 uint8_t gb_audio_read(GBContext* ctx, uint16_t addr) {
@@ -292,14 +501,21 @@ uint8_t gb_audio_read(GBContext* ctx, uint16_t addr) {
 void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
     GBAudio* apu = (GBAudio*)ctx->apu;
     if (!apu) return;
+
+    if (g_audio_debug_trace_enabled) {
+        audio_debug_trace_log("[WRITE] cyc=%u addr=%04X %s <= %02X\n",
+            ctx ? ctx->cycles : 0, addr, audio_reg_name(addr), value);
+    }
     
     /* If APU disabled (NR52 bit 7 off), write to registers ignored unless it's NR52 or Wave RAM */
     bool power_on = (apu->nr52 & 0x80) != 0;
     
     if (addr == 0xFF26) {
         /* NR52 - Power Control */
+        bool was_powered = (apu->nr52 & 0x80) != 0;
+        bool power_enable = (value & 0x80) != 0;
         apu->nr52 = (apu->nr52 & 0x0F) | (value & 0x80); /* Keep status bits, update power bit */
-        if (!(value & 0x80)) {
+        if (!power_enable) {
             /* Power off: clear all registers */
             memset(&apu->ch1, 0, sizeof(Channel1));
             memset(&apu->ch2, 0, sizeof(Channel2));
@@ -307,7 +523,11 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
             memset(&apu->ch4, 0, sizeof(Channel4));
             apu->nr50 = 0;
             apu->nr51 = 0;
+            audio_reset_timing_state(apu);
+        } else if (!was_powered) {
+            audio_reset_timing_state(apu);
         }
+        audio_debug_dump_state(ctx, apu, power_enable ? "nr52-power-on" : "nr52-power-off");
         return;
     }
     
@@ -330,11 +550,13 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
         case 0xFF13: apu->ch1.nr13 = value; break;
         case 0xFF14: 
             apu->ch1.nr14 = value;
+            apu->ch1.length_enabled = (value & 0x40) != 0;
             if (value & 0x80) {
                 /* Trigger Event */
-                apu->ch1.enabled = true;
+                apu->ch1.enabled = (apu->ch1.nr12 & 0xF8) != 0;
                 if (apu->ch1.length_counter == 0) apu->ch1.length_counter = 64;
-                apu->ch1.length_enabled = (value & 0x40) != 0;
+                apu->ch1.timer = 0;
+                apu->ch1.wave_pos = 0;
                 
                 /* Envelope Reload */
                 apu->ch1.volume = (apu->ch1.nr12 >> 4);
@@ -350,6 +572,7 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
                     /* Overflow check on trigger */
                     if (calc_sweep(&apu->ch1) > 2047) apu->ch1.enabled = false;
                 }
+                audio_debug_dump_state(ctx, apu, "trigger-ch1");
             }
             break;
             
@@ -365,15 +588,18 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
         case 0xFF18: apu->ch2.nr23 = value; break;
         case 0xFF19: 
             apu->ch2.nr24 = value;
+            apu->ch2.length_enabled = (value & 0x40) != 0;
             if (value & 0x80) {
-                apu->ch2.enabled = true;
+                apu->ch2.enabled = (apu->ch2.nr22 & 0xF8) != 0;
                 if (apu->ch2.length_counter == 0) apu->ch2.length_counter = 64;
-                apu->ch2.length_enabled = (value & 0x40) != 0;
+                apu->ch2.timer = 0;
+                apu->ch2.wave_pos = 0;
 
                 /* Envelope Reload */
                 apu->ch2.volume = (apu->ch2.nr22 >> 4);
                 apu->ch2.env_timer = (apu->ch2.nr22 & 0x07);
                 if (apu->ch2.env_timer == 0) apu->ch2.env_timer = 8;
+                audio_debug_dump_state(ctx, apu, "trigger-ch2");
             }
             break;
             
@@ -382,21 +608,29 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
             apu->ch3.nr30 = value; 
             if (!(value & 0x80)) apu->ch3.enabled = false;
             break;
-        case 0xFF1B: apu->ch3.nr31 = value; break;
+        case 0xFF1B:
+            apu->ch3.nr31 = value;
+            apu->ch3.length_counter = 256 - value;
+            break;
         case 0xFF1C: apu->ch3.nr32 = value; break;
         case 0xFF1D: apu->ch3.nr33 = value; break;
         case 0xFF1E: 
             apu->ch3.nr34 = value;
+            apu->ch3.length_enabled = (value & 0x40) != 0;
             if (value & 0x80) {
-                apu->ch3.enabled = true;
+                apu->ch3.enabled = (apu->ch3.nr30 & 0x80) != 0;
                 if (apu->ch3.length_counter == 0) apu->ch3.length_counter = 256;
-                apu->ch3.length_enabled = (value & 0x40) != 0;
+                apu->ch3.timer = 0;
                 apu->ch3.wave_pos = 0;
+                audio_debug_dump_state(ctx, apu, "trigger-ch3");
             }
             break;
             
         /* Channel 4 */
-        case 0xFF20: apu->ch4.nr41 = value; break;
+        case 0xFF20:
+            apu->ch4.nr41 = value;
+            apu->ch4.length_counter = 64 - (value & 0x3F);
+            break;
         case 0xFF21: 
             apu->ch4.nr42 = value; 
             if ((value & 0xF8) == 0) apu->ch4.enabled = false;
@@ -404,10 +638,11 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
         case 0xFF22: apu->ch4.nr43 = value; break;
         case 0xFF23: 
             apu->ch4.nr44 = value;
+            apu->ch4.length_enabled = (value & 0x40) != 0;
             if (value & 0x80) {
-                apu->ch4.enabled = true;
+                apu->ch4.enabled = (apu->ch4.nr42 & 0xF8) != 0;
                 if (apu->ch4.length_counter == 0) apu->ch4.length_counter = 64;
-                apu->ch4.length_enabled = (value & 0x40) != 0;
+                apu->ch4.accum = 0;
                 
                 /* Envelope Reload */
                 apu->ch4.volume = (apu->ch4.nr42 >> 4);
@@ -416,6 +651,7 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
                 
                 /* LFSR Reload */
                 apu->ch4.lfsr = 0x7FFF;
+                audio_debug_dump_state(ctx, apu, "trigger-ch4");
             }
             break;
             
@@ -438,61 +674,6 @@ void gb_audio_write(GBContext* ctx, uint16_t addr, uint8_t value) {
 void gb_audio_step(GBContext* ctx, uint32_t cycles) {
     GBAudio* apu = (GBAudio*)ctx->apu;
     if (!apu || !(apu->nr52 & 0x80)) return;
-    
-    /* Advance Frame Sequencer (512 Hz) */
-    /* 4194304 / 512 = 8192 cycles */
-    apu->fs_timer += cycles;
-    while (apu->fs_timer >= 8192) {
-        apu->fs_timer -= 8192;
-        apu->fs_step = (apu->fs_step + 1) & 7;
-        
-        /* Step Length (256 Hz): Steps 0, 2, 4, 6 */
-        if ((apu->fs_step & 1) == 0) {
-            /* Channel 1 Length */
-            if (apu->ch1.length_enabled && apu->ch1.length_counter > 0) {
-                apu->ch1.length_counter--;
-                if (apu->ch1.length_counter == 0) apu->ch1.enabled = false;
-            }
-            /* Channel 2 Length */
-            if (apu->ch2.length_enabled && apu->ch2.length_counter > 0) {
-                apu->ch2.length_counter--;
-                if (apu->ch2.length_counter == 0) apu->ch2.enabled = false;
-            }
-        }
-        
-        /* Step Sweep (128 Hz): Steps 2, 6 */
-        if (apu->fs_step == 2 || apu->fs_step == 6) {
-            Channel1* ch1 = &apu->ch1;
-            if (ch1->sweep_enabled && ch1->enabled) {
-                ch1->sweep_timer--;
-                if (ch1->sweep_timer <= 0) {
-                    /* Reload timer */
-                    uint8_t period = (ch1->nr10 >> 4) & 0x07;
-                    ch1->sweep_timer = (period == 0) ? 8 : period;
-                    
-                    if (period > 0 && (ch1->nr10 & 0x07) > 0) {
-                        uint16_t new_freq = calc_sweep(ch1);
-                        if (new_freq <= 2047) {
-                            ch1->shadow_freq = new_freq;
-                            ch1->nr13 = new_freq & 0xFF;
-                            ch1->nr14 = (ch1->nr14 & ~0x07) | ((new_freq >> 8) & 0x07);
-                            /* Perform semantic overflow check again */
-                            if (calc_sweep(ch1) > 2047) ch1->enabled = false;
-                        } else {
-                            ch1->enabled = false;
-                        }
-                    }
-                }
-            }
-        }
-        
-        /* Step Envelope (64 Hz): Step 7 */
-        if (apu->fs_step == 7) {
-            if (apu->ch1.enabled) step_envelope(&apu->ch1.env_timer, &apu->ch1.volume, apu->ch1.nr12);
-            if (apu->ch2.enabled) step_envelope(&apu->ch2.env_timer, &apu->ch2.volume, apu->ch2.nr22);
-            if (apu->ch4.enabled) step_envelope(&apu->ch4.env_timer, &apu->ch4.volume, apu->ch4.nr42);
-        }
-    }
     
     /* Generate Samples? */
     /* 4194304 Hz / 44100 Hz = 95.1 cycles/sample */
@@ -527,10 +708,10 @@ void gb_audio_step(GBContext* ctx, uint32_t cycles) {
     /* Channel 3 Stepping */
     if (apu->ch3.enabled) {
         uint16_t freq_raw = apu->ch3.nr33 | ((apu->ch3.nr34 & 0x07) << 8);
-        uint32_t period = (2048 - freq_raw) * 2; /* Wave channel is 2x faster clocking? 65536Hz base */
+        uint32_t period = (2048 - freq_raw) * 2;
         if (period == 0) period = 2;
 
-        apu->ch3.timer += (cycles); /* TODO: Verify wave timing scalar */
+        apu->ch3.timer += cycles;
         while (apu->ch3.timer >= period) {
             apu->ch3.timer -= period;
             apu->ch3.wave_pos = (apu->ch3.wave_pos + 1) & 31;
@@ -547,18 +728,12 @@ void gb_audio_step(GBContext* ctx, uint32_t cycles) {
         /* Minimum period is 8 cycles? */
         if (period < 8) period = 8;
 
-        /* Clock LFSR */
-        /* TODO: This timer logic is simplified, assumes we handle all cycles */
-        /* Normally we'd track residual */
-        /* For noise, we just want to know if we should clock the LFSR */
-        /* Accumulate cycles */
-        /* For noise, we just want to know if we should clock the LFSR */
-        /* Accumulate cycles */
         apu->ch4.accum += cycles;
-        
-        while (apu->ch4.accum >= period) {
-            apu->ch4.accum -= period;
-            
+
+        uint32_t steps = apu->ch4.accum / period;
+        apu->ch4.accum %= period;
+
+        while (steps-- > 0) {
             /* Shift LFSR */
             uint16_t lfsr = apu->ch4.lfsr;
             bool xor_res = (lfsr & 1) ^ ((lfsr >> 1) & 1);
@@ -587,29 +762,27 @@ void gb_audio_step(GBContext* ctx, uint32_t cycles) {
         
         int16_t left = 0;
         int16_t right = 0;
+        int ch1_mix = 0;
+        int ch2_mix = 0;
+        int ch3_mix = 0;
+        int ch4_mix = 0;
         
         /* Channel 1 Output */
         if (apu->ch1.enabled && (apu->ch1.nr12 & 0xF0)) { // DAC ON
              int duty = (apu->ch1.nr11 >> 6) & 3;
-             int output = DUTY_CYCLES[duty][apu->ch1.wave_pos];
-             
-             if (output) {
-                 int vol = apu->ch1.volume;
-                 if (apu->nr51 & 0x01) right += vol;
-                 if (apu->nr51 & 0x10) left += vol;
-             }
+             int output = DUTY_CYCLES[duty][apu->ch1.wave_pos] ? 1 : -1;
+             ch1_mix = apu->ch1.volume * output;
+             if (apu->nr51 & 0x01) right += ch1_mix;
+             if (apu->nr51 & 0x10) left += ch1_mix;
         }
         
         /* Channel 2 Output */
         if (apu->ch2.enabled && (apu->ch2.nr22 & 0xF0)) { // DAC ON
              int duty = (apu->ch2.nr21 >> 6) & 3;
-             int output = DUTY_CYCLES[duty][apu->ch2.wave_pos];
-             
-             if (output) {
-                 int vol = apu->ch2.volume;
-                 if (apu->nr51 & 0x02) right += vol;
-                 if (apu->nr51 & 0x20) left += vol;
-             }
+             int output = DUTY_CYCLES[duty][apu->ch2.wave_pos] ? 1 : -1;
+             ch2_mix = apu->ch2.volume * output;
+             if (apu->nr51 & 0x02) right += ch2_mix;
+             if (apu->nr51 & 0x20) left += ch2_mix;
         }
 
         /* Channel 3 Output */
@@ -621,25 +794,23 @@ void gb_audio_step(GBContext* ctx, uint32_t cycles) {
              /* Apply volume shift */
              uint8_t vol_code = (apu->ch3.nr32 >> 5) & 3;
              switch (vol_code) {
-                 case 0: sample = 0; break; /* Mute */
+                 case 0: sample = 8; break; /* Mute => centered silence */
                  case 1: break; /* 100% */
                  case 2: sample >>= 1; break; /* 50% */
                  case 3: sample >>= 2; break; /* 25% */
              }
-             
-             if (apu->nr51 & 0x04) right += sample;
-             if (apu->nr51 & 0x40) left += sample;
+
+             ch3_mix = (int)sample - 8;
+             if (apu->nr51 & 0x04) right += ch3_mix;
+             if (apu->nr51 & 0x40) left += ch3_mix;
         }
 
         /* Channel 4 Output */
         if (apu->ch4.enabled && (apu->ch4.nr42 & 0xF0)) { // DAC ON
-             bool output = !(apu->ch4.lfsr & 1); /* Output is inverted bit 0 */
-             
-             if (output) {
-                 int vol = apu->ch4.volume;
-                 if (apu->nr51 & 0x08) right += vol;
-                 if (apu->nr51 & 0x80) left += vol;
-             }
+             int output = !(apu->ch4.lfsr & 1) ? 1 : -1;
+             ch4_mix = apu->ch4.volume * output;
+             if (apu->nr51 & 0x08) right += ch4_mix;
+             if (apu->nr51 & 0x80) left += ch4_mix;
         }
         
         /* Master Volume / Scaling */
@@ -651,21 +822,76 @@ void gb_audio_step(GBContext* ctx, uint32_t cycles) {
         int vol_l = (apu->nr50 >> 4) & 7;
         int vol_r = (apu->nr50 & 7);
         
-        left = left * (vol_l + 1) * 64;
-        right = right * (vol_r + 1) * 64;
+        int32_t mixed_left = left * (vol_l + 1) * 64;
+        int32_t mixed_right = right * (vol_r + 1) * 64;
+        left = audio_apply_highpass(mixed_left, &apu->hp_prev_in_l, &apu->hp_prev_out_l);
+        right = audio_apply_highpass(mixed_right, &apu->hp_prev_in_r, &apu->hp_prev_out_r);
+
+        if (g_audio_debug_trace_enabled) {
+            bool nonzero = (left != 0) || (right != 0);
+            int32_t peak = abs((int)left);
+            if (abs((int)right) > peak) peak = abs((int)right);
+
+            g_debug_trace_total_samples++;
+            g_debug_trace_window_samples++;
+            if (nonzero) g_debug_trace_window_nonzero++;
+            if (ch1_mix != 0) g_debug_trace_window_channel_nonzero[0]++;
+            if (ch2_mix != 0) g_debug_trace_window_channel_nonzero[1]++;
+            if (ch3_mix != 0) g_debug_trace_window_channel_nonzero[2]++;
+            if (ch4_mix != 0) g_debug_trace_window_channel_nonzero[3]++;
+            if (peak > g_debug_trace_window_peak) g_debug_trace_window_peak = peak;
+
+            if (nonzero && !g_debug_trace_first_nonzero_logged) {
+                g_debug_trace_first_nonzero_logged = true;
+                audio_debug_trace_log(
+                    "[FIRST-NONZERO] sample=%llu time_ms=%.2f cyc=%u left=%d right=%d "
+                    "ch=[%d,%d,%d,%d]\n",
+                    (unsigned long long)g_debug_trace_total_samples,
+                    (double)g_debug_trace_total_samples * 1000.0 / 44100.0,
+                    ctx ? ctx->cycles : 0,
+                    left, right,
+                    ch1_mix, ch2_mix, ch3_mix, ch4_mix);
+                audio_debug_dump_state(ctx, apu, "first-nonzero");
+            }
+
+            if (g_debug_trace_window_samples >= 44100) {
+                uint64_t second_index = g_debug_trace_total_samples / 44100;
+                audio_debug_trace_log(
+                    "[SECOND %llu] cyc=%u nonzero=%u/%u peak=%d ch1=%u ch2=%u ch3=%u ch4=%u\n",
+                    (unsigned long long)second_index,
+                    ctx ? ctx->cycles : 0,
+                    g_debug_trace_window_nonzero,
+                    g_debug_trace_window_samples,
+                    g_debug_trace_window_peak,
+                    g_debug_trace_window_channel_nonzero[0],
+                    g_debug_trace_window_channel_nonzero[1],
+                    g_debug_trace_window_channel_nonzero[2],
+                    g_debug_trace_window_channel_nonzero[3]);
+                audio_debug_dump_state(ctx, apu, "second-summary");
+                g_debug_trace_window_samples = 0;
+                g_debug_trace_window_nonzero = 0;
+                memset(g_debug_trace_window_channel_nonzero, 0, sizeof(g_debug_trace_window_channel_nonzero));
+                g_debug_trace_window_peak = 0;
+            }
+        }
 
         /* Debug Audio Logging - now controlled by runtime flag */
-        if (g_audio_debug_enabled && g_debug_sample_count < DEBUG_AUDIO_MAX_SAMPLES) {
+        if (g_audio_debug_enabled && g_debug_sample_count < g_debug_capture_limit_samples) {
             if (!g_debug_audio_file) g_debug_audio_file = fopen("debug_audio.raw", "wb");
             if (g_debug_audio_file) {
-                int16_t samples[2] = { (int16_t)left, (int16_t)right };
-                fwrite(samples, sizeof(int16_t), 2, g_debug_audio_file);
-                
+                g_debug_audio_buffer[g_debug_audio_buffer_count * 2] = (int16_t)left;
+                g_debug_audio_buffer[g_debug_audio_buffer_count * 2 + 1] = (int16_t)right;
+                g_debug_audio_buffer_count++;
                 g_debug_sample_count++;
-                if (g_debug_sample_count >= DEBUG_AUDIO_MAX_SAMPLES) {
+                if (g_debug_audio_buffer_count >= DEBUG_AUDIO_BUFFER_FRAMES) {
+                    audio_debug_capture_flush();
+                }
+                if (g_debug_sample_count >= g_debug_capture_limit_samples) {
+                    audio_debug_capture_flush();
                     printf("[AUDIO] Debug capture complete. Wrote %d samples to debug_audio.raw\n", g_debug_sample_count);
                     fclose(g_debug_audio_file);
                     g_debug_audio_file = NULL;
+                    g_debug_audio_buffer_count = 0;
                 }
             }
         }
@@ -673,21 +899,30 @@ void gb_audio_step(GBContext* ctx, uint32_t cycles) {
     }
 }
 
-void gb_audio_div_reset(void* apu_ptr) {
+void gb_audio_div_tick(void* apu_ptr, uint16_t old_div, uint16_t new_div) {
     if (!apu_ptr) return;
     GBAudio* apu = (GBAudio*)apu_ptr;
-    
-    /* When DIV is reset, the internal counter for the Frame Sequencer is NOT affected 
-       directly, but the way Game Boy hardware derives the 512 Hz clock is from 
-       specific bits of the DIV counter. 
-       
-       However, a simplified behavior that is commonly used is that resetting DIV
-       effectively aligns the Frame Sequencer timer.
-       
-       Exact behavior:
-       Frame Sequencer clocked by Bit 12 (falling edge presumably) of the internal DIV counter.
-       Writing to DIV resets internal counter to 0. 
-       So we should reset our accumulation timer.
-    */
-    apu->fs_timer = 0;
+    if (!(apu->nr52 & 0x80)) return;
+
+    const uint16_t fs_mask = 1 << 12;
+    uint16_t current = old_div;
+    uint32_t cycles_left = (uint16_t)(new_div - old_div);
+
+    while (cycles_left > 0) {
+        uint16_t next_fall = (current | (uint16_t)((fs_mask * 2) - 1)) + 1;
+        uint32_t dist = (uint16_t)(next_fall - current);
+        if (dist == 0) dist = fs_mask * 2;
+
+        if (cycles_left >= dist) {
+            audio_clock_frame_sequencer(apu);
+            current = (uint16_t)(current + dist);
+            cycles_left -= dist;
+        } else {
+            break;
+        }
+    }
+}
+
+void gb_audio_div_reset(void* apu_ptr, uint16_t old_div) {
+    gb_audio_div_tick(apu_ptr, old_div, 0);
 }

@@ -6,10 +6,12 @@
 #include "platform_sdl.h"
 #include "gbrt.h"   /* For GBPlatformCallbacks */
 #include "ppu.h"
+#include "audio_stats.h"
 #include "gbrt_debug.h"
 
 #ifdef GB_HAS_SDL2
 #include <SDL.h>
+#include <atomic>
 #include "imgui.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "backends/imgui_impl_sdlrenderer2.h"
@@ -26,6 +28,8 @@ static uint32_t g_last_frame_time = 0;
 static SDL_AudioDeviceID g_audio_device = 0;
 static SDL_GameController* g_controller = NULL;
 static bool g_vsync = false;  /* VSync OFF - we pace with wall clock for 59.7 FPS */
+static bool g_audio_started = false;
+static uint32_t g_audio_start_threshold = 0;
 
 /* Performance timing diagnostics */
 static uint32_t g_timing_render_total = 0;
@@ -170,8 +174,10 @@ void gb_platform_shutdown(void) {
 
     if (g_controller) {
         SDL_GameControllerClose(g_controller);
-        g_controller == NULL;
+        g_controller = NULL;
     }
+    g_audio_started = false;
+    g_audio_start_threshold = 0;
     
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
@@ -206,12 +212,23 @@ void gb_platform_shutdown(void) {
  */
 #define AUDIO_RING_SIZE 16384  /* ~370ms buffer - plenty of headroom */
 static int16_t g_audio_ring[AUDIO_RING_SIZE * 2];  /* Stereo */
-static volatile uint32_t g_audio_write_pos = 0;
-static volatile uint32_t g_audio_read_pos = 0;
+static std::atomic<uint32_t> g_audio_write_pos{0};
+static std::atomic<uint32_t> g_audio_read_pos{0};
+static uint32_t g_audio_device_sample_rate = AUDIO_SAMPLE_RATE;
 
 /* Debug counters */
 static uint32_t g_audio_samples_written = 0;
 static uint32_t g_audio_underruns = 0;
+
+static uint32_t audio_ring_fill_samples(void) {
+    uint32_t write_pos = g_audio_write_pos.load(std::memory_order_acquire);
+    uint32_t read_pos = g_audio_read_pos.load(std::memory_order_acquire);
+    return (write_pos >= read_pos) ? (write_pos - read_pos) : (AUDIO_RING_SIZE - read_pos + write_pos);
+}
+
+static void update_audio_stats_from_ring(void) {
+    audio_stats_update_buffer(audio_ring_fill_samples(), AUDIO_RING_SIZE, g_audio_device_sample_rate);
+}
 
 /* SDL callback - pulls samples from ring buffer */
 static void sdl_audio_callback(void* userdata, Uint8* stream, int len) {
@@ -219,8 +236,8 @@ static void sdl_audio_callback(void* userdata, Uint8* stream, int len) {
     int16_t* out = (int16_t*)stream;
     int samples_needed = len / 4;  /* Stereo 16-bit = 4 bytes per sample */
     
-    uint32_t write_pos = g_audio_write_pos;
-    uint32_t read_pos = g_audio_read_pos;
+    uint32_t write_pos = g_audio_write_pos.load(std::memory_order_acquire);
+    uint32_t read_pos = g_audio_read_pos.load(std::memory_order_relaxed);
     
     for (int i = 0; i < samples_needed; i++) {
         if (read_pos != write_pos) {
@@ -233,28 +250,36 @@ static void sdl_audio_callback(void* userdata, Uint8* stream, int len) {
             out[i * 2] = 0;
             out[i * 2 + 1] = 0;
             g_audio_underruns++;
+            audio_stats_underrun();
         }
     }
     
-    g_audio_read_pos = read_pos;
+    g_audio_read_pos.store(read_pos, std::memory_order_release);
 }
 
 static void on_audio_sample(GBContext* ctx, int16_t left, int16_t right) {
     (void)ctx;
     if (g_audio_device == 0) return;
     
-    uint32_t write_pos = g_audio_write_pos;
+    uint32_t write_pos = g_audio_write_pos.load(std::memory_order_relaxed);
     uint32_t next_write = (write_pos + 1) % AUDIO_RING_SIZE;
     
     /* If buffer is full, drop this sample (prevents blocking) */
-    if (next_write == g_audio_read_pos) {
+    if (next_write == g_audio_read_pos.load(std::memory_order_acquire)) {
+        audio_stats_samples_dropped(1);
         return;  /* Drop sample */
     }
     
     g_audio_ring[write_pos * 2] = left;
     g_audio_ring[write_pos * 2 + 1] = right;
-    g_audio_write_pos = next_write;
+    g_audio_write_pos.store(next_write, std::memory_order_release);
     g_audio_samples_written++;
+    audio_stats_samples_queued(1);
+
+    if (!g_audio_started && audio_ring_fill_samples() >= g_audio_start_threshold) {
+        SDL_PauseAudioDevice(g_audio_device, 0);
+        g_audio_started = true;
+    }
 }
 
 bool gb_platform_init(int scale) {
@@ -293,9 +318,18 @@ bool gb_platform_init(int scale) {
     if (g_audio_device == 0) {
         fprintf(stderr, "[SDL] Failed to open audio: %s\n", SDL_GetError());
     } else {
+        g_audio_write_pos.store(0, std::memory_order_relaxed);
+        g_audio_read_pos.store(0, std::memory_order_relaxed);
+        g_audio_started = false;
+        g_audio_device_sample_rate = (uint32_t)have.freq;
+        g_audio_start_threshold = (uint32_t)have.samples;
+        if (g_audio_start_threshold == 0) g_audio_start_threshold = 1;
+        if (g_audio_start_threshold > AUDIO_RING_SIZE / 2) {
+            g_audio_start_threshold = AUDIO_RING_SIZE / 2;
+        }
         fprintf(stderr, "[SDL] Audio initialized: %d Hz, %d channels, buffer %d samples (Callback Mode)\n", 
                 have.freq, have.channels, have.samples);
-        SDL_PauseAudioDevice(g_audio_device, 0); /* Start playing */
+        update_audio_stats_from_ring();
     }
     
     fprintf(stderr, "[SDL] Creating window...\n");
@@ -680,6 +714,7 @@ void gb_platform_render_frame(const uint32_t* framebuffer) {
         ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.35f); 
         if (ImGui::Begin("Overlay", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+            update_audio_stats_from_ring();
             ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::Text("Press ESC for Menu");
             /* Timing diagnostics */
@@ -687,11 +722,8 @@ void gb_platform_render_frame(const uint32_t* framebuffer) {
                 float avg_render = (float)g_timing_render_total / g_timing_frame_count;
                 float avg_vsync = (float)g_timing_vsync_total / g_timing_frame_count;
                 ImGui::Text("Render: %.1fms, VSync: %.1fms", avg_render, avg_vsync);
-                /* Ring buffer fill level */
-                uint32_t w = g_audio_write_pos;
-                uint32_t r = g_audio_read_pos;
-                uint32_t fill = (w >= r) ? (w - r) : (AUDIO_RING_SIZE - r + w);
-                ImGui::Text("AudioBuf: %u/%u, Underruns:%u", fill, AUDIO_RING_SIZE, g_audio_underruns);
+                ImGui::Text("AudioBuf: %u/%u, Underruns:%u", audio_ring_fill_samples(), AUDIO_RING_SIZE, g_audio_underruns);
+                ImGui::TextUnformatted(audio_stats_get_summary());
             }
             ImGui::End();
         }
@@ -713,24 +745,24 @@ uint8_t gb_platform_get_joypad(void) {
 
 void gb_platform_vsync(void) {
     /* 
-     * Frame pacing: Run at exactly 59.7 FPS using high-resolution timing.
-     * This is essential for non-60Hz monitors.
-     * Audio generation and consumption will naturally sync because
-     * we produce ~735 samples per 16.74ms frame = 44100 Hz.
+     * Frame pacing: Run at the DMG frame cadence derived from 70224 cycles
+     * at 4194304 Hz, and ease off sleeping when audio fill is too low.
      */
     static uint64_t next_frame_time = 0;
+    static uint64_t frame_remainder = 0;
+    const uint64_t gb_frame_cycles = 70224;
+    const uint64_t gb_cpu_hz = 4194304;
     uint64_t freq = SDL_GetPerformanceFrequency();
     uint64_t now = SDL_GetPerformanceCounter();
-    
-    /* GameBoy frame period: 1/59.7 seconds = 16.75ms = 16750 microseconds */
-    const uint64_t FRAME_PERIOD_US = 16750;
     
     if (next_frame_time == 0) {
         next_frame_time = now;
     }
-    
-    /* Wait until next frame time */
-    if (now < next_frame_time) {
+
+    uint32_t audio_fill = audio_ring_fill_samples();
+    bool audio_starved = g_audio_started && audio_fill < (g_audio_start_threshold / 2);
+
+    if (!audio_starved && now < next_frame_time) {
         uint64_t wait_ticks = next_frame_time - now;
         uint32_t wait_us = (uint32_t)((wait_ticks * 1000000) / freq);
         
@@ -745,13 +777,19 @@ void gb_platform_vsync(void) {
     }
     
     /* Schedule next frame */
-    next_frame_time += (freq * FRAME_PERIOD_US) / 1000000;
+    uint64_t frame_ticks_num = (freq * gb_frame_cycles) + frame_remainder;
+    next_frame_time += frame_ticks_num / gb_cpu_hz;
+    frame_remainder = frame_ticks_num % gb_cpu_hz;
     
     /* If we fell behind by more than 3 frames, reset (don't try to catch up) */
-    if (SDL_GetPerformanceCounter() > next_frame_time + (freq * FRAME_PERIOD_US * 3) / 1000000) {
+    uint64_t max_frame_lag = ((freq * gb_frame_cycles * 3) + gb_cpu_hz - 1) / gb_cpu_hz;
+    if (SDL_GetPerformanceCounter() > next_frame_time + max_frame_lag) {
         next_frame_time = SDL_GetPerformanceCounter();
+        frame_remainder = 0;
     }
     
+    update_audio_stats_from_ring();
+    audio_stats_tick(SDL_GetTicks64());
     g_last_frame_time = SDL_GetTicks();
 }
 

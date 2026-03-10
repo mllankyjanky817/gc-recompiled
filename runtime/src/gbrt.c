@@ -1,6 +1,7 @@
 #include "gbrt.h"
 #include "ppu.h"
 #include "audio.h"
+#include "audio_stats.h"
 #include "platform_sdl.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +55,7 @@ GBContext* gb_context_create(const GBConfig* config) {
     }
     
     ctx->apu = gb_audio_create();
+    audio_stats_init();
     gb_context_reset(ctx, true);
     (void)config;
 
@@ -92,6 +94,10 @@ void gb_context_destroy(GBContext* ctx) {
 }
 
 void gb_context_reset(GBContext* ctx, bool skip_bootrom) {
+    if (ctx->apu) {
+        gb_audio_reset(ctx->apu);
+    }
+
     /* Reset DMA state */
     ctx->dma.active = 0;
     ctx->dma.source_high = 0;
@@ -578,7 +584,7 @@ void gb_write8(GBContext* ctx, uint16_t addr, uint8_t value) {
             uint16_t old_div = ctx->div_counter;
             ctx->div_counter = 0; 
             ctx->io[0x04] = 0; /* Update register view immediately */
-            if (ctx->apu) gb_audio_div_reset(ctx->apu);
+            if (ctx->apu) gb_audio_div_reset(ctx->apu, old_div);
             
             /* DIV Reset Glitch: 
              * If the selected bit for TIMA is 1 in old_div and becomes 0 (it does, since div is 0),
@@ -929,6 +935,7 @@ void gb_tick(GBContext* ctx, uint32_t cycles) {
     uint16_t old_div = ctx->div_counter;
     ctx->div_counter += (uint16_t)cycles;
     ctx->io[0x04] = (uint8_t)(ctx->div_counter >> 8);
+    if (ctx->apu) gb_audio_div_tick(ctx->apu, old_div, ctx->div_counter);
     
     uint8_t tac = ctx->io[0x07];
     if (tac & 0x04) { /* Timer Enabled */

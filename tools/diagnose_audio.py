@@ -23,6 +23,7 @@ RAW_FILE = "debug_audio.raw"
 EXPECTED_SAMPLE_RATE = 44100
 CHANNELS = 2
 SAMPLE_WIDTH = 2  # 16-bit
+MAX_SECONDS_TO_PRINT = 30
 
 # GameBoy constants
 GB_CPU_FREQ = 4194304  # Hz
@@ -77,6 +78,10 @@ def analyze_audio_file(filepath: str):
     
     print(f"Left channel:  Peak [{left_min:6d}, {left_max:6d}], RMS: {left_rms:.1f}")
     print(f"Right channel: Peak [{right_min:6d}, {right_max:6d}], RMS: {right_rms:.1f}")
+    if left:
+        left_mean = sum(left) / len(left)
+        right_mean = sum(right) / len(right)
+        print(f"DC offset:     L={left_mean:.1f} R={right_mean:.1f}")
     
     if left_max == 0 and left_min == 0 and right_max == 0 and right_min == 0:
         print("⚠️  WARNING: Audio is completely silent!")
@@ -175,13 +180,16 @@ def analyze_audio_file(filepath: str):
     
     if num_full_seconds > 0:
         rms_per_second = []
-        for sec in range(min(num_full_seconds, 10)):  # First 10 seconds
+        seconds_to_print = min(num_full_seconds, MAX_SECONDS_TO_PRINT)
+        for sec in range(seconds_to_print):
             start = sec * samples_per_sec
             end = start + samples_per_sec
             sec_left = left[start:end]
             sec_rms = math.sqrt(sum(s*s for s in sec_left) / len(sec_left))
             rms_per_second.append(sec_rms)
             print(f"  Second {sec+1}: RMS = {sec_rms:.1f}")
+        if num_full_seconds > seconds_to_print:
+            print(f"  ... omitted {num_full_seconds - seconds_to_print} later seconds")
         
         # Check for consistency
         if rms_per_second:
@@ -217,9 +225,10 @@ def analyze_audio_file(filepath: str):
     else:
         print("✓ No major issues detected in audio data")
     
-    print(f"\nNOTE: This analysis shows the GENERATED audio is correct.")
-    print("If playback is choppy, the issue is in the SDL audio pipeline,")
-    print("not in audio generation. Check buffer sizes and queue management.")
+    print("\nNOTE: A raw capture only proves what the emulator generated,")
+    print("not whether that output is faithful to hardware or whether playback")
+    print("timing was healthy at runtime. Combine this with --audio-stats output,")
+    print("startup expectations, and in-game listening before blaming SDL alone.")
     
     return True
 

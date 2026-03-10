@@ -744,43 +744,54 @@ void IRBuilder::lower_store_mem(const Instruction& instr, ir::BasicBlock& block)
 
 void IRBuilder::lower_alu_r(const Instruction& instr, ir::BasicBlock& block) {
     IRInstruction ir;
+    bool src_is_hl_indirect = false;
     switch (instr.type) {
         case InstructionType::ADD_A_R:
         case InstructionType::ADD_A_HL:
             ir.opcode = Opcode::ADD8;
+            src_is_hl_indirect = (instr.type == InstructionType::ADD_A_HL);
             break;
         case InstructionType::ADC_A_R:
         case InstructionType::ADC_A_HL:
             ir.opcode = Opcode::ADC8;
+            src_is_hl_indirect = (instr.type == InstructionType::ADC_A_HL);
             break;
         case InstructionType::SUB_A_R:
         case InstructionType::SUB_A_HL:
             ir.opcode = Opcode::SUB8;
+            src_is_hl_indirect = (instr.type == InstructionType::SUB_A_HL);
             break;
         case InstructionType::SBC_A_R:
         case InstructionType::SBC_A_HL:
             ir.opcode = Opcode::SBC8;
+            src_is_hl_indirect = (instr.type == InstructionType::SBC_A_HL);
             break;
         case InstructionType::AND_A_R:
         case InstructionType::AND_A_HL:
             ir.opcode = Opcode::AND8;
+            src_is_hl_indirect = (instr.type == InstructionType::AND_A_HL);
             break;
         case InstructionType::OR_A_R:
         case InstructionType::OR_A_HL:
             ir.opcode = Opcode::OR8;
+            src_is_hl_indirect = (instr.type == InstructionType::OR_A_HL);
             break;
         case InstructionType::XOR_A_R:
         case InstructionType::XOR_A_HL:
             ir.opcode = Opcode::XOR8;
+            src_is_hl_indirect = (instr.type == InstructionType::XOR_A_HL);
             break;
         case InstructionType::CP_A_R:
         case InstructionType::CP_A_HL:
             ir.opcode = Opcode::CP8;
+            src_is_hl_indirect = (instr.type == InstructionType::CP_A_HL);
             break;
         default:
             ir.opcode = Opcode::NOP;
     }
-    ir.src = Operand::reg8(static_cast<uint8_t>(instr.reg8_src));
+    ir.src = src_is_hl_indirect
+        ? Operand::reg8(6)  // 6 = (HL), handled as an indirect read by the emitter
+        : Operand::reg8(static_cast<uint8_t>(instr.reg8_src));
     ir.cycles = instr.cycles;
     emit(block, ir, instr);
 }

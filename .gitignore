@@ -52,3 +52,7 @@ logs/
 
 tools/mgbdis
 imgui.ini
+
+# Python
+__pycache__/
+*.pyc
