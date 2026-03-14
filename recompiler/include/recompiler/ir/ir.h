@@ -305,7 +305,7 @@ struct Program {
     uint16_t rom_bank_count = 0;
     
     // Entry points
-    uint16_t main_entry = 0x100;
+    uint16_t main_entry = arch::GC_RESET_ENTRY;
     std::vector<uint16_t> interrupt_vectors;
     
     // Create a new block

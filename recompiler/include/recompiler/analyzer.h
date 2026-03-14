@@ -1,6 +1,6 @@
 /**
  * @file analyzer.h
- * @brief Control flow analysis for GameBoy ROMs
+ * @brief Control flow analysis for game.com ROMs
  */
 
 #ifndef RECOMPILER_ANALYZER_H
@@ -105,7 +105,7 @@ struct AnalysisResult {
     std::set<uint16_t> bank_switch_addresses;
     
     // Entry point
-    uint16_t entry_point = 0x100;
+    uint16_t entry_point = arch::GC_RESET_ENTRY;
     
     // Interrupt vectors
     std::vector<uint16_t> interrupt_vectors;

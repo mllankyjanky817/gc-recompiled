@@ -125,6 +125,7 @@ typedef struct GBContext {
     
     /* Current bank numbers */
     uint16_t rom_bank;    /**< Current ROM bank (0x4000-0x7FFF) - 9 bits for MBC5 */
+    uint8_t mmu[5];       /**< game.com MMU window mapping for 0x1000-0x9FFF */
     uint8_t ram_bank;     /**< Current RAM bank */
     uint8_t wram_bank;    /**< Current WRAM bank (CGB only) */
     uint8_t vram_bank;    /**< Current VRAM bank (CGB only) */

@@ -1,58 +1,25 @@
 /**
  * @file rom.h
- * @brief GameBoy ROM loader and header parser
- * 
- * Handles loading ROM files, parsing the cartridge header,
- * detecting MBC type, and validating ROM structure.
+ * @brief game.com ROM loader and MMU-oriented metadata
  */
 
 #ifndef RECOMPILER_ROM_H
 #define RECOMPILER_ROM_H
 
+#include "recompiler/architecture.h"
+
 #include <cstdint>
+#include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
-#include <memory>
-#include <optional>
-#include <filesystem>
 
 namespace gbrecomp {
 
-/* ============================================================================
- * MBC Types
- * ========================================================================== */
-
 enum class MBCType : uint8_t {
-    NONE = 0x00,           // 32KB ROM only
-    MBC1 = 0x01,           // MBC1
-    MBC1_RAM = 0x02,       // MBC1 + RAM
-    MBC1_RAM_BATTERY = 0x03,
-    MBC2 = 0x05,
-    MBC2_BATTERY = 0x06,
-    ROM_RAM = 0x08,
-    ROM_RAM_BATTERY = 0x09,
-    MMM01 = 0x0B,
-    MMM01_RAM = 0x0C,
-    MMM01_RAM_BATTERY = 0x0D,
-    MBC3_TIMER_BATTERY = 0x0F,
-    MBC3_TIMER_RAM_BATTERY = 0x10,
-    MBC3 = 0x11,
-    MBC3_RAM = 0x12,
-    MBC3_RAM_BATTERY = 0x13,
-    MBC5 = 0x19,
-    MBC5_RAM = 0x1A,
-    MBC5_RAM_BATTERY = 0x1B,
-    MBC5_RUMBLE = 0x1C,
-    MBC5_RUMBLE_RAM = 0x1D,
-    MBC5_RUMBLE_RAM_BATTERY = 0x1E,
-    MBC6 = 0x20,
-    MBC7_SENSOR_RUMBLE_RAM_BATTERY = 0x22,
-    POCKET_CAMERA = 0xFC,
-    BANDAI_TAMA5 = 0xFD,
-    HUC3 = 0xFE,
-    HUC1_RAM_BATTERY = 0xFF,
-    
-    UNKNOWN = 0xFE
+    NONE = 0x00,
+    MMU = 0x80,
+    UNKNOWN = 0xFF
 };
 
 /**
@@ -75,74 +42,23 @@ bool mbc_has_battery(MBCType type);
  */
 bool mbc_has_rtc(MBCType type);
 
-/* ============================================================================
- * ROM Header Structure
- * ========================================================================== */
-
-/**
- * @brief Parsed ROM header information
- * 
- * GameBoy cartridge header is located at 0x0100-0x014F
- */
 struct ROMHeader {
-    // 0x0100-0x0103: Entry point (usually NOP; JP 0x0150)
-    uint8_t entry_point[4];
-    
-    // 0x0104-0x0133: Nintendo logo (48 bytes)
-    uint8_t nintendo_logo[48];
-    
-    // 0x0134-0x0143: Title (up to 16 chars, or 11 for CGB)
     std::string title;
-    
-    // 0x013F-0x0142: Manufacturer code (newer games)
-    std::string manufacturer_code;
-    
-    // 0x0143: CGB flag
-    uint8_t cgb_flag;
-    
-    // 0x0144-0x0145: New licensee code
-    std::string new_licensee_code;
-    
-    // 0x0146: SGB flag
-    uint8_t sgb_flag;
-    
-    // 0x0147: Cartridge type (MBC)
-    MBCType mbc_type;
-    
-    // 0x0148: ROM size code
-    uint8_t rom_size_code;
-    
-    // 0x0149: RAM size code
-    uint8_t ram_size_code;
-    
-    // 0x014A: Destination code (0=Japan, 1=Overseas)
-    uint8_t destination_code;
-    
-    // 0x014B: Old licensee code
-    uint8_t old_licensee_code;
-    
-    // 0x014C: ROM version
-    uint8_t rom_version;
-    
-    // 0x014D: Header checksum
-    uint8_t header_checksum;
-    
-    // 0x014E-0x014F: Global checksum
-    uint16_t global_checksum;
-    
-    // Computed values
-    size_t rom_size_bytes;       // Actual ROM size
-    size_t ram_size_bytes;       // External RAM size
-    uint16_t rom_banks;          // Number of ROM banks
-    uint8_t ram_banks;           // Number of RAM banks
-    
-    bool is_cgb;                 // CGB enhanced or only
-    bool is_cgb_only;            // CGB only (won't run on DMG)
-    bool is_sgb;                 // SGB enhanced
-    
-    bool header_checksum_valid;
-    bool global_checksum_valid;
-    bool logo_valid;
+    MBCType mbc_type = MBCType::MMU;
+    size_t rom_size_bytes = 0;
+    size_t ram_size_bytes = 0;
+    uint16_t rom_banks = 0;
+    uint8_t ram_banks = 0;
+    bool is_cgb = false;
+    bool is_cgb_only = false;
+    bool is_sgb = false;
+    bool header_checksum_valid = true;
+    bool global_checksum_valid = true;
+    bool logo_valid = true;
+    uint16_t reset_entry = arch::GC_RESET_ENTRY;
+    uint16_t vector_table_start = arch::GC_VECTOR_TABLE_START;
+    uint8_t mmu_window_count = arch::GC_ROM_WINDOW_COUNT;
+    uint16_t bank_window_size = arch::GC_ROM_WINDOW_SIZE;
 };
 
 /* ============================================================================
@@ -191,9 +107,14 @@ public:
     const std::string& error() const { return error_; }
     
     // Helper methods
-    bool has_banking() const { return header_.rom_banks > 2; }
+    bool has_banking() const { return header_.rom_banks > 1; }
     bool has_ram() const { return header_.ram_size_bytes > 0; }
     uint16_t bank_count() const { return header_.rom_banks; }
+    uint16_t main_entry() const { return header_.reset_entry; }
+    uint16_t visible_rom_start() const { return arch::GC_ROM_WINDOW_START; }
+    uint16_t visible_rom_end() const { return arch::GC_ROM_WINDOW_END; }
+    uint16_t bank_window_size() const { return header_.bank_window_size; }
+    bool is_visible_rom_address(uint16_t addr) const { return arch::is_visible_rom_address(addr); }
 
 private:
     ROM() = default;

@@ -1,6 +1,6 @@
 /**
  * @file main.cpp
- * @brief GameBoy Recompiler CLI entry point
+ * @brief game.com recompiler CLI entry point
  */
 
 #include "recompiler/rom.h"
@@ -29,12 +29,12 @@ void print_banner() {
   \____|\__,_|_| |_| |_|\___|____/ \___/ \__, |_| \_\___|\___\___/|_| |_| |_| .__/|_|_|\___|\__,_|
                                          |___/                              |_|                   
 )" << '\n';
-    std::cout << "  GameBoy Static Recompiler v0.1.0\n";
+    std::cout << "  game.com Static Recompiler v0.1.0\n";
     std::cout << "  https://github.com/arcanite24/gb-recompiled\n\n";
 }
 
 void print_usage(const char* program) {
-    std::cout << "Usage: " << program << " <rom.gb> [options]\n\n";
+    std::cout << "Usage: " << program << " <rom.bin> [options]\n\n";
     std::cout << "Options:\n";
     std::cout << "  -o, --output <dir>    Output directory (default: <rom>_output)\n";
     std::cout << "  -d, --disasm          Disassemble only (don't generate code)\n";
@@ -45,7 +45,7 @@ void print_usage(const char* program) {
     std::cout << "  --single-function     Generate all code in a single function\n";
     std::cout << "  --no-comments         Don't include disassembly comments\n";
     std::cout << "  --bank <n>            Only process bank n\n";
-    std::cout << "  --add-entry-point b:a Add manual entry point (e.g. 1:4000)\n";
+    std::cout << "  --add-entry-point b:a Add manual entry point (e.g. 1:1000)\n";
     std::cout << "  --no-scan             Disable aggressive code scanning (enabled by default)\n";
     std::cout << "  --use-trace <file>    Use runtime trace to find entry points\n";
     std::cout << "  -h, --help            Show this help\n";
@@ -205,28 +205,6 @@ int main(int argc, char* argv[]) {
     analyze_opts.entry_points = manual_entry_points;
     analyze_opts.aggressive_scan = aggressive_scan;
     analyze_opts.trace_file_path = trace_file_path;
-
-    // Detect standard HRAM DMA routine
-    // Routine: LDH (46),A; LD A,28; DEC A; JR NZ,-3; RET
-    const std::vector<uint8_t> pattern = {0xE0, 0x46, 0x3E, 0x28, 0x3D, 0x20, 0xFD, 0xC9};
-    const std::vector<uint8_t>& data = rom.bytes();
-    
-    auto it = std::search(data.begin(), data.end(), pattern.begin(), pattern.end());
-    if (it != data.end()) {
-            size_t rom_idx = std::distance(data.begin(), it);
-            uint8_t bank = rom_idx / 0x4000;
-            uint16_t offset = rom_idx % 0x4000;
-            if (bank > 0) offset += 0x4000;
-        
-            std::cout << "Detected OAM DMA routine at ROM 0x" << std::hex << rom_idx 
-                        << " (Bank " << (int)bank << ":0x" << offset << "). Mapping to HRAM 0xFF80.\n" << std::dec;
-            
-            gbrecomp::AnalyzerOptions::RamOverlay overlay;
-            overlay.ram_addr = 0xFF80;
-            overlay.rom_addr = gbrecomp::AnalysisResult::make_addr(bank, offset);
-            overlay.size = 8;
-            analyze_opts.ram_overlays.push_back(overlay);
-    }
 
     auto analysis = gbrecomp::analyze(rom, analyze_opts);
     

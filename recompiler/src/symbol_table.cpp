@@ -171,28 +171,26 @@ public:
     }
     
     /**
-     * @brief Add standard GameBoy symbols
+     * @brief Add standard game.com symbols
      */
     void add_standard_symbols() {
-        // Interrupt vectors
-        add_symbol(0x0040, "vblank_handler", Symbol::Type::FUNCTION);
-        add_symbol(0x0048, "lcdc_handler", Symbol::Type::FUNCTION);
-        add_symbol(0x0050, "timer_handler", Symbol::Type::FUNCTION);
-        add_symbol(0x0058, "serial_handler", Symbol::Type::FUNCTION);
-        add_symbol(0x0060, "joypad_handler", Symbol::Type::FUNCTION);
-        
-        // RST vectors
-        add_symbol(0x0000, "rst_00", Symbol::Type::FUNCTION);
-        add_symbol(0x0008, "rst_08", Symbol::Type::FUNCTION);
-        add_symbol(0x0010, "rst_10", Symbol::Type::FUNCTION);
-        add_symbol(0x0018, "rst_18", Symbol::Type::FUNCTION);
-        add_symbol(0x0020, "rst_20", Symbol::Type::FUNCTION);
-        add_symbol(0x0028, "rst_28", Symbol::Type::FUNCTION);
-        add_symbol(0x0030, "rst_30", Symbol::Type::FUNCTION);
-        add_symbol(0x0038, "rst_38", Symbol::Type::FUNCTION);
-        
-        // Entry point
-        add_symbol(0x0100, "entry", Symbol::Type::FUNCTION);
+        add_symbol(0x1000, "irq_vector_1000", Symbol::Type::FUNCTION);
+        add_symbol(0x1002, "irq_vector_1002", Symbol::Type::FUNCTION);
+        add_symbol(0x1004, "irq_vector_1004", Symbol::Type::FUNCTION);
+        add_symbol(0x1006, "irq_vector_1006", Symbol::Type::FUNCTION);
+        add_symbol(0x1008, "irq_vector_1008", Symbol::Type::FUNCTION);
+        add_symbol(0x100A, "irq_vector_100a", Symbol::Type::FUNCTION);
+        add_symbol(0x100C, "irq_vector_100c", Symbol::Type::FUNCTION);
+        add_symbol(0x100E, "irq_vector_100e", Symbol::Type::FUNCTION);
+        add_symbol(0x1010, "irq_vector_1010", Symbol::Type::FUNCTION);
+        add_symbol(0x1012, "irq_vector_1012", Symbol::Type::FUNCTION);
+        add_symbol(0x1014, "irq_vector_1014", Symbol::Type::FUNCTION);
+        add_symbol(0x1016, "irq_vector_1016", Symbol::Type::FUNCTION);
+        add_symbol(0x1018, "irq_vector_1018", Symbol::Type::FUNCTION);
+        add_symbol(0x101A, "irq_vector_101a", Symbol::Type::FUNCTION);
+        add_symbol(0x101C, "irq_vector_101c", Symbol::Type::FUNCTION);
+        add_symbol(0x101E, "irq_vector_101e", Symbol::Type::FUNCTION);
+        add_symbol(0x1020, "entry", Symbol::Type::FUNCTION);
     }
     
 private:

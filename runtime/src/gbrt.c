@@ -12,11 +12,14 @@
  * Definitions
  * ========================================================================== */
 
-#define WRAM_BANK_SIZE 0x1000
-#define VRAM_SIZE      0x2000
-#define OAM_SIZE       0xA0
-#define IO_SIZE        0x80
-#define HRAM_SIZE      0x7F
+#define GC_REGISTER_FILE_SIZE 0x80
+#define GC_INTERNAL_RAM_SIZE  0x380
+#define GC_ROM_WINDOW_START   0x1000
+#define GC_ROM_WINDOW_SIZE    0x2000
+#define GC_ROM_WINDOW_COUNT   5
+#define GC_ROM_WINDOW_END     0xA000
+#define GC_VRAM_SIZE          0x4000
+#define GC_EXT_RAM_SIZE       0x2000
 
 /* ============================================================================
  * Globals
@@ -37,11 +40,13 @@ GBContext* gb_context_create(const GBConfig* config) {
     GBContext* ctx = (GBContext*)calloc(1, sizeof(GBContext));
     if (!ctx) return NULL;
     
-    ctx->wram = (uint8_t*)calloc(1, WRAM_BANK_SIZE * 8);
-    ctx->vram = (uint8_t*)calloc(1, VRAM_SIZE * 2);
-    ctx->oam = (uint8_t*)calloc(1, OAM_SIZE);
-    ctx->hram = (uint8_t*)calloc(1, HRAM_SIZE);
-    ctx->io = (uint8_t*)calloc(1, IO_SIZE + 1);
+    ctx->wram = (uint8_t*)calloc(1, GC_INTERNAL_RAM_SIZE);
+    ctx->vram = (uint8_t*)calloc(1, GC_VRAM_SIZE);
+    ctx->oam = (uint8_t*)calloc(1, 1);
+    ctx->hram = (uint8_t*)calloc(1, 1);
+    ctx->io = (uint8_t*)calloc(1, GC_REGISTER_FILE_SIZE);
+    ctx->eram = (uint8_t*)calloc(1, GC_EXT_RAM_SIZE);
+    ctx->eram_size = GC_EXT_RAM_SIZE;
     
     if (!ctx->wram || !ctx->vram || !ctx->oam || !ctx->hram || !ctx->io) {
         gb_context_destroy(ctx);
@@ -128,55 +133,28 @@ void gb_context_reset(GBContext* ctx, bool skip_bootrom) {
     ctx->rtc.last_time = 0;
     ctx->rtc.active = true;  /* RTC oscillator active by default */
     
-    /* Reset MBC state */
+    /* Reset mapper/MMU state */
     ctx->rtc_mode = 0;
     ctx->rtc_reg = 0;
     ctx->ram_enabled = 0;
     ctx->mbc_mode = 0;
     ctx->rom_bank_upper = 0;
+    ctx->mmu[0] = 0;
+    ctx->mmu[1] = 1;
+    ctx->mmu[2] = 2;
+    ctx->mmu[3] = 3;
+    ctx->mmu[4] = 4;
     
     if (skip_bootrom) {
-        ctx->pc = 0x0100;
-        ctx->sp = 0xFFFE;
-        ctx->af = 0x01B0;
-        ctx->bc = 0x0013;
-        ctx->de = 0x00D8;
-        ctx->hl = 0x014D;
+        ctx->pc = 0x1020;
+        ctx->sp = 0x03FF;
+        ctx->af = 0x0000;
+        ctx->bc = 0x0000;
+        ctx->de = 0x0000;
+        ctx->hl = 0x0000;
         gb_unpack_flags(ctx);
-        ctx->rom_bank = 1;
-        ctx->wram_bank = 1;
-        
-        ctx->io[0x05] = 0x00; /* TIMA */
-        ctx->io[0x06] = 0x00; /* TMA */
-        ctx->io[0x07] = 0x00; /* TAC */
-        ctx->io[0x10] = 0x80; /* NR10 */
-        ctx->io[0x11] = 0xBF; /* NR11 */
-        ctx->io[0x12] = 0xF3; /* NR12 */
-        ctx->io[0x14] = 0xBF; /* NR14 */
-        ctx->io[0x16] = 0x3F; /* NR21 */
-        ctx->io[0x17] = 0x00; /* NR22 */
-        ctx->io[0x19] = 0xBF; /* NR24 */
-        ctx->io[0x1A] = 0x7F; /* NR30 */
-        ctx->io[0x1B] = 0xFF; /* NR31 */
-        ctx->io[0x1C] = 0x9F; /* NR32 */
-        ctx->io[0x1E] = 0xBF; /* NR34 */
-        ctx->io[0x20] = 0xFF; /* NR41 */
-        ctx->io[0x21] = 0x00; /* NR42 */
-        ctx->io[0x22] = 0x00; /* NR43 */
-        ctx->io[0x23] = 0xBF; /* NR44 */
-        ctx->io[0x24] = 0x77; /* NR50 */
-        ctx->io[0x25] = 0xF3; /* NR51 */
-        ctx->io[0x26] = 0xF1; /* NR52 */
-        ctx->io[0x40] = 0x91; /* LCDC */
-        ctx->io[0x42] = 0x00; /* SCY */
-        ctx->io[0x43] = 0x00; /* SCX */
-        ctx->io[0x45] = 0x00; /* LYC */
-        ctx->io[0x47] = 0xFC; /* BGP */
-        ctx->io[0x48] = 0xFF; /* OBP0 */
-        ctx->io[0x49] = 0xFF; /* OBP1 */
-        ctx->io[0x4A] = 0x00; /* WY */
-        ctx->io[0x4B] = 0x00; /* WX */
-        ctx->io[0x80] = 0x00; /* IE */
+        ctx->rom_bank = 0;
+        memset(ctx->io, 0, GC_REGISTER_FILE_SIZE);
     }
 }
 
@@ -186,77 +164,10 @@ bool gb_context_load_rom(GBContext* ctx, const uint8_t* data, size_t size) {
     if (!ctx->rom) return false;
     memcpy(ctx->rom, data, size);
     ctx->rom_size = size;
-    
-    /* Parse Header for RAM/Battery info */
-    if (size > 0x149) {
-        uint8_t type = ctx->rom[0x147];
-        uint8_t ram_size_code = ctx->rom[0x149];
-        
-        /* Check if battery is present */
-        bool has_battery = false;
-        switch (type) {
-            case 0x03: /* MBC1+RAM+BATTERY */
-            case 0x06: /* MBC2+BATTERY */
-            case 0x09: /* ROM+RAM+BATTERY */
-            case 0x0D: /* MMM01+RAM+BATTERY */
-            case 0x0F: /* MBC3+TIMER+BATTERY */
-            case 0x10: /* MBC3+TIMER+RAM+BATTERY */
-            case 0x13: /* MBC3+RAM+BATTERY */
-            case 0x1B: /* MBC5+RAM+BATTERY */
-            case 0x1E: /* MBC5+RUMBLE+RAM+BATTERY */
-            case 0x22: /* MBC7+SENSOR+RUMBLE+RAM+BATTERY */
-            case 0xFF: /* HuC1+RAM+BATTERY */
-                has_battery = true;
-                break;
-        }
-        
-        /* Calculate RAM size */
-        size_t ram_bytes = 0;
-        
-        /* MBC2 has fixed 512x4 bits (256 bytes effective, usually 512 allocated) */
-        if (type == 0x05 || type == 0x06) {
-            ram_bytes = 512;
-            ram_size_code = 0; /* Override */
-        } else {
-            switch (ram_size_code) {
-                case 0x00: ram_bytes = 0; break;
-                case 0x01: ram_bytes = 2 * 1024; break; /* 2KB */
-                case 0x02: ram_bytes = 8 * 1024; break; /* 8KB */
-                case 0x03: ram_bytes = 32 * 1024; break; /* 32KB (4 banks) */
-                case 0x04: ram_bytes = 128 * 1024; break; /* 128KB (16 banks) */
-                case 0x05: ram_bytes = 64 * 1024; break; /* 64KB (8 banks) */
-                default: ram_bytes = 0; break;
-            }
-        }
-        
-        /* Allocate RAM */
-        if (ctx->eram) free(ctx->eram);
-        ctx->eram = NULL;
-        ctx->eram_size = 0;
-        
-        if (ram_bytes > 0) {
-            ctx->eram = (uint8_t*)calloc(1, ram_bytes);
-            if (ctx->eram) {
-                ctx->eram_size = ram_bytes;
-                printf("[GBRT] Allocated %zu bytes for External RAM\n", ram_bytes);
-                
-                /* Load Save Data if Battery Present */
-                if (has_battery && ctx->callbacks.load_battery_ram) {
-                    /* Get ROM title for filename */
-                    char title[17] = {0};
-                    memcpy(title, &ctx->rom[0x134], 16);
-                    /* Sanitize title */
-                    for(int i=0; i<16; i++) {
-                        if(title[i] == 0 || title[i] < 32 || title[i] > 126) title[i] = 0;
-                    }
-                    if(title[0] == 0) strcpy(title, "UNKNOWN_GAME");
-                    
-                    if (ctx->callbacks.load_battery_ram(ctx, title, ctx->eram, ctx->eram_size)) {
-                         printf("[GBRT] Loaded battery RAM for '%s'\n", title);
-                    }
-                }
-            }
-        }
+
+    if (!ctx->eram) {
+        ctx->eram = (uint8_t*)calloc(1, GC_EXT_RAM_SIZE);
+        ctx->eram_size = GC_EXT_RAM_SIZE;
     }
     
     return true;
@@ -291,350 +202,60 @@ bool gb_context_save_ram(GBContext* ctx) {
  * ========================================================================== */
 
 uint8_t gb_read8(GBContext* ctx, uint16_t addr) {
-    /* During OAM DMA, only HRAM (0xFF80-0xFFFE) is accessible */
-    if (ctx->dma.active && !(addr >= 0xFF80 && addr < 0xFFFF)) {
-        return 0xFF;  /* Bus conflict - return undefined */
+    if (addr < GC_REGISTER_FILE_SIZE) {
+        return ctx->io[addr];
     }
-    
-    /* ROM Bank 0 (0x0000-0x3FFF) */
-    if (addr < 0x4000) {
-        /* MBC1 Mode 1: Upper bits affect bank 0 region too */
-        if (ctx->mbc_type >= 0x01 && ctx->mbc_type <= 0x03 && ctx->mbc_mode == 1) {
-            uint32_t bank0 = (uint32_t)ctx->rom_bank_upper << 5;
-            uint32_t rom_addr = (bank0 * 0x4000) + addr;
-            if (rom_addr < ctx->rom_size) {
-                return ctx->rom[rom_addr];
-            }
-            return 0xFF;
-        }
-        return ctx->rom[addr];
+    if (addr < GC_ROM_WINDOW_START) {
+        size_t offset = addr - GC_REGISTER_FILE_SIZE;
+        return offset < GC_INTERNAL_RAM_SIZE ? ctx->wram[offset] : 0xFF;
     }
-    
-    /* ROM Bank N (0x4000-0x7FFF) */
-    if (addr < 0x8000) {
-        uint32_t rom_addr = ((uint32_t)ctx->rom_bank * 0x4000) + (addr - 0x4000);
-        if (rom_addr < ctx->rom_size) {
-            return ctx->rom[rom_addr];
-        }
-        return 0xFF;
+    if (addr < GC_ROM_WINDOW_END) {
+        uint8_t window = (uint8_t)((addr - GC_ROM_WINDOW_START) / GC_ROM_WINDOW_SIZE);
+        uint16_t within = (uint16_t)((addr - GC_ROM_WINDOW_START) % GC_ROM_WINDOW_SIZE);
+        uint8_t bank = ctx->mmu[window];
+        size_t rom_addr = (size_t)bank * GC_ROM_WINDOW_SIZE + within;
+        ctx->rom_bank = bank;
+        return (ctx->rom && rom_addr < ctx->rom_size) ? ctx->rom[rom_addr] : 0xFF;
     }
-    
-    /* VRAM (0x8000-0x9FFF) */
-    if (addr < 0xA000) {
-        if ((ctx->io[0x41] & 3) == 3) return 0xFF;
-        return ctx->vram[(ctx->vram_bank * VRAM_SIZE) + (addr - 0x8000)];
+    if (addr < 0xE000) {
+        return ctx->vram[addr - 0xA000];
     }
-    
-    /* External RAM / RTC (0xA000-0xBFFF) */
-    if (addr < 0xC000) {
-        if (!ctx->ram_enabled) return 0xFF;
-        
-        /* MBC3 RTC mode */
-        if (ctx->rtc_mode) {
-            switch (ctx->rtc_reg) {
-                case 0x08: return ctx->rtc.latched_s;
-                case 0x09: return ctx->rtc.latched_m;
-                case 0x0A: return ctx->rtc.latched_h;
-                case 0x0B: return ctx->rtc.latched_dl;
-                case 0x0C: return ctx->rtc.latched_dh;
-                default: return 0xFF;
-            }
-        }
-        
-        /* MBC2: 512x4 bit internal RAM (upper 4 bits always high) */
-        if (ctx->mbc_type >= 0x05 && ctx->mbc_type <= 0x06) {
-            /* MBC2 RAM is only 512 bytes, echoed throughout 0xA000-0xBFFF */
-            if (ctx->eram) {
-                return ctx->eram[(addr - 0xA000) & 0x1FF] | 0xF0;
-            }
-            return 0xFF;
-        }
-        
-        /* Standard external RAM */
-        if (ctx->eram) {
-            uint32_t eram_addr = ((uint32_t)ctx->ram_bank * 0x2000) + (addr - 0xA000);
-            if (eram_addr < ctx->eram_size) {
-                return ctx->eram[eram_addr];
-            }
-        }
-        return 0xFF;
+    if (addr <= 0xFFFF) {
+        size_t offset = addr - 0xE000;
+        return (ctx->eram && offset < ctx->eram_size) ? ctx->eram[offset] : 0xFF;
     }
-    if (addr < 0xD000) return ctx->wram[addr - 0xC000];
-    if (addr < 0xE000) return ctx->wram[(ctx->wram_bank * WRAM_BANK_SIZE) + (addr - 0xD000)];
-    if (addr < 0xFE00) return gb_read8(ctx, addr - 0x2000);
-    if (addr < 0xFEA0) {
-        uint8_t stat = ctx->io[0x41] & 3;
-        if (stat == 2 || stat == 3) return 0xFF;
-        return ctx->oam[addr - 0xFE00];
-    }
-    if (addr < 0xFF00) return 0xFF;
-    if (addr < 0xFF80) {
-        if (addr == 0xFF00) {
-             // DBG_GENERAL("Reading JOYP 0xFF00");
-             uint8_t joyp = ctx->io[0x00];
-             // Bits 6-7 always 1. Bits 4-5 return what was written.
-             uint8_t res = 0xC0 | (joyp & 0x30) | 0x0F;
-             if (!(joyp & 0x10)) res &= g_joypad_dpad;
-             if (!(joyp & 0x20)) res &= g_joypad_buttons;
-             return res;
-        }
-        if (addr == 0xFF04) return (uint8_t)(ctx->div_counter >> 8);
-        if (addr >= 0xFF40 && addr <= 0xFF4B) return ppu_read_register((GBPPU*)ctx->ppu, addr);
-        if (addr >= 0xFF10 && addr <= 0xFF3F) return gb_audio_read(ctx, addr);
-        return ctx->io[addr - 0xFF00];
-    }
-    if (addr < 0xFFFF) return ctx->hram[addr - 0xFF80];
-    if (addr == 0xFFFF) return ctx->io[0x80];
     return 0xFF;
 }
 
 void gb_write8(GBContext* ctx, uint16_t addr, uint8_t value) {
-    /* During OAM DMA, only HRAM (0xFF80-0xFFFE) is writable */
-    if (ctx->dma.active && !(addr >= 0xFF80 && addr < 0xFFFF)) {
-        return;  /* Bus conflict - write ignored */
-    }
-    
-    /* MBC Write Handling */
-    if (addr < 0x8000) {
-        /* ================================================================
-         * MBC1 (Cartridge types 0x01, 0x02, 0x03)
-         * ================================================================ */
-        if (ctx->mbc_type >= 0x01 && ctx->mbc_type <= 0x03) {
-            if (addr < 0x2000) {
-                /* 0x0000-0x1FFF: RAM Enable */
-                ctx->ram_enabled = ((value & 0x0F) == 0x0A);
-            } else if (addr < 0x4000) {
-                /* 0x2000-0x3FFF: ROM Bank Number (lower 5 bits) */
-                uint8_t bank = value & 0x1F;
-                if (bank == 0) bank = 1;  /* Bank 0 is not selectable */
-                ctx->rom_bank = (ctx->rom_bank & 0x60) | bank;
-            } else if (addr < 0x6000) {
-                /* 0x4000-0x5FFF: RAM Bank / Upper ROM Bank bits */
-                ctx->rom_bank_upper = value & 0x03;
-                if (ctx->mbc_mode == 0) {
-                    /* Mode 0: Upper 2 bits go to ROM bank */
-                    ctx->rom_bank = (ctx->rom_bank & 0x1F) | (ctx->rom_bank_upper << 5);
-                } else {
-                    /* Mode 1: Used as RAM bank */
-                    ctx->ram_bank = ctx->rom_bank_upper;
-                }
-            } else {
-                /* 0x6000-0x7FFF: Banking Mode Select */
-                ctx->mbc_mode = value & 0x01;
-                if (ctx->mbc_mode == 0) {
-                    /* Mode 0: RAM bank fixed to 0, upper bits go to ROM */
-                    ctx->ram_bank = 0;
-                    ctx->rom_bank = (ctx->rom_bank & 0x1F) | (ctx->rom_bank_upper << 5);
-                } else {
-                    /* Mode 1: RAM bank from upper bits, ROM bank fixed lower region */
-                    ctx->ram_bank = ctx->rom_bank_upper;
-                }
-            }
-            /* MBC1 quirk: Banks 0x00, 0x20, 0x40, 0x60 map to 0x01, 0x21, 0x41, 0x61 */
-            if ((ctx->rom_bank & 0x1F) == 0) {
-                ctx->rom_bank = (ctx->rom_bank & 0x60) | 0x01;
-            }
-        }
-        /* ================================================================
-         * MBC2 (Cartridge types 0x05, 0x06)
-         * ================================================================ */
-        else if (ctx->mbc_type >= 0x05 && ctx->mbc_type <= 0x06) {
-            if (addr < 0x4000) {
-                /* MBC2: Bit 8 of addr determines RAM enable vs ROM bank */
-                if (addr & 0x0100) {
-                    /* 0x2100-0x3FFF: ROM Bank Number (lower 4 bits) */
-                    ctx->rom_bank = value & 0x0F;
-                    if (ctx->rom_bank == 0) ctx->rom_bank = 1;
-                } else {
-                    /* 0x0000-0x1FFF: RAM Enable (if bit 8 is 0) */
-                    ctx->ram_enabled = ((value & 0x0F) == 0x0A);
-                }
-            }
-            /* 0x4000-0x7FFF: Unused for MBC2 */
-        }
-        /* ================================================================
-         * MBC3 (Cartridge types 0x0F, 0x10, 0x11, 0x12, 0x13)
-         * ================================================================ */
-        else if (ctx->mbc_type >= 0x0F && ctx->mbc_type <= 0x13) {
-            if (addr < 0x2000) {
-                /* RAM/RTC Enable */
-                ctx->ram_enabled = ((value & 0x0F) == 0x0A);
-            } else if (addr < 0x4000) {
-                /* ROM Bank Number (1-127) */
-                ctx->rom_bank = value & 0x7F;
-                if (ctx->rom_bank == 0) ctx->rom_bank = 1;
-            } else if (addr < 0x6000) {
-                /* RAM Bank Number or RTC Register Select */
-                if (value <= 0x03) {
-                    ctx->rtc_mode = 0;
-                    ctx->ram_bank = value;
-                } else if (value >= 0x08 && value <= 0x0C) {
-                    ctx->rtc_mode = 1;
-                    ctx->rtc_reg = value;
-                }
-            } else {
-                /* Latch Clock Data */
-                if (ctx->rtc.latch_state == 0 && value == 0) {
-                    ctx->rtc.latch_state = 1;
-                } else if (ctx->rtc.latch_state == 1 && value == 1) {
-                    ctx->rtc.latch_state = 0;
-                    /* Latch current time */
-                    ctx->rtc.latched_s = ctx->rtc.s;
-                    ctx->rtc.latched_m = ctx->rtc.m;
-                    ctx->rtc.latched_h = ctx->rtc.h;
-                    ctx->rtc.latched_dl = ctx->rtc.dl;
-                    ctx->rtc.latched_dh = ctx->rtc.dh;
-                } else {
-                    ctx->rtc.latch_state = 0;
-                }
-            }
-        }
-        /* ================================================================
-         * MBC5 (Cartridge types 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E)
-         * ================================================================ */
-        else if (ctx->mbc_type >= 0x19 && ctx->mbc_type <= 0x1E) {
-            if (addr < 0x2000) {
-                /* RAM Enable */
-                ctx->ram_enabled = ((value & 0x0F) == 0x0A);
-            } else if (addr < 0x3000) {
-                /* ROM Bank Number (lower 8 bits) */
-                ctx->rom_bank = (ctx->rom_bank & 0x100) | value;
-                /* MBC5 allows bank 0 - no fixup needed */
-            } else if (addr < 0x4000) {
-                /* ROM Bank Number (9th bit) */
-                ctx->rom_bank = (ctx->rom_bank & 0xFF) | ((value & 0x01) << 8);
-            } else if (addr < 0x6000) {
-                /* RAM Bank Number (0-15) */
-                ctx->ram_bank = value & 0x0F;
-            }
-            /* 0x6000-0x7FFF: Unused for MBC5 */
-        }
-        /* ================================================================
-         * No MBC / ROM Only (type 0x00) or Unknown
-         * ================================================================ */
-        else {
-            /* Simple fallback: just ROM bank register */
-            if (addr >= 0x2000 && addr < 0x4000) {
-                ctx->rom_bank = value & 0x1F;
-                if (ctx->rom_bank == 0) ctx->rom_bank = 1;
-            }
+    if (addr < GC_REGISTER_FILE_SIZE) {
+        ctx->io[addr] = value;
+        if (addr >= 0x24 && addr <= 0x28) {
+            ctx->mmu[addr - 0x24] = value;
         }
         return;
     }
-    if (addr < 0xA000) {
-        /* VRAM Write - Check STAT mode 3 */
-        // if ((ctx->io[0x41] & 3) == 3) return;
-        
-        ctx->vram[(ctx->vram_bank * VRAM_SIZE) + (addr - 0x8000)] = value;
-        return;
-    }
-    if (addr < 0xC000) {
-        /* External RAM / RTC Write */
-        if (!ctx->ram_enabled) return;
-        
-        /* MBC3 RTC mode */
-        if (ctx->rtc_mode) {
-            /* RTC Register Write */
-            switch (ctx->rtc_reg) {
-                case 0x08: ctx->rtc.s = value % 60; break;
-                case 0x09: ctx->rtc.m = value % 60; break;
-                case 0x0A: ctx->rtc.h = value % 24; break;
-                case 0x0B: ctx->rtc.dl = value; break;
-                case 0x0C: 
-                    ctx->rtc.dh = value; 
-                    ctx->rtc.active = !(value & 0x40); /* Bit 6 is Halt */
-                    break;
-            }
-            return;
-        }
-        
-        /* MBC2: 512x4 bit internal RAM (only lower 4 bits stored) */
-        if (ctx->mbc_type >= 0x05 && ctx->mbc_type <= 0x06) {
-            if (ctx->eram) {
-                ctx->eram[(addr - 0xA000) & 0x1FF] = value & 0x0F;
-            }
-            return;
-        }
-        
-        /* Standard external RAM */
-        if (ctx->eram) {
-            uint32_t eram_addr = ((uint32_t)ctx->ram_bank * 0x2000) + (addr - 0xA000);
-            if (eram_addr < ctx->eram_size) {
-                ctx->eram[eram_addr] = value;
-            }
+    if (addr < GC_ROM_WINDOW_START) {
+        size_t offset = addr - GC_REGISTER_FILE_SIZE;
+        if (offset < GC_INTERNAL_RAM_SIZE) {
+            ctx->wram[offset] = value;
         }
         return;
     }
-    if (addr < 0xD000) { ctx->wram[addr - 0xC000] = value; return; }
-    if (addr < 0xE000) { ctx->wram[(ctx->wram_bank * WRAM_BANK_SIZE) + (addr - 0xD000)] = value; return; }
-    if (addr < 0xFE00) { gb_write8(ctx, addr - 0x2000, value); return; }
-    if (addr < 0xFEA0) { 
-        /* OAM Write - Check STAT mode 2 or 3 */
-        uint8_t stat = ctx->io[0x41] & 3;
-        // if (stat == 2 || stat == 3) return;
-        
-        ctx->oam[addr - 0xFE00] = value; 
-        return; 
-    }
-    if (addr < 0xFF00) return;
-    if (addr < 0xFF80) {
-        if (addr >= 0xFF40 && addr <= 0xFF4B) { ppu_write_register((GBPPU*)ctx->ppu, ctx, addr, value); return; }
-        if (addr >= 0xFF10 && addr <= 0xFF3F) { gb_audio_write(ctx, addr, value); return; }
-        if (addr == 0xFF04) { 
-            uint16_t old_div = ctx->div_counter;
-            ctx->div_counter = 0; 
-            ctx->io[0x04] = 0; /* Update register view immediately */
-            if (ctx->apu) gb_audio_div_reset(ctx->apu, old_div);
-            
-            /* DIV Reset Glitch: 
-             * If the selected bit for TIMA is 1 in old_div and becomes 0 (it does, since div is 0),
-             * this counts as a falling edge and increments TIMA.
-             */
-             uint8_t tac = ctx->io[0x07];
-             if (tac & 0x04) { /* Timer Enabled */
-                uint16_t mask;
-                switch (tac & 0x03) {
-                    case 0: mask = 1 << 9; break; /* 1024 cycles */
-                    case 1: mask = 1 << 3; break; /* 16 cycles */
-                    case 2: mask = 1 << 5; break; /* 64 cycles */
-                    case 3: mask = 1 << 7; break; /* 256 cycles */
-                    default: mask = 0; break;
-                }
-                if (old_div & mask) {
-                    /* Glitch triggered: Increment TIMA */
-                    if (ctx->io[0x05] == 0xFF) { 
-                        ctx->io[0x05] = ctx->io[0x06]; 
-                        ctx->io[0x0F] |= 0x04; 
-                    } else {
-                        ctx->io[0x05]++;
-                    }
-                }
-             }
-            return; 
-        }
-        if (addr == 0xFF46) {
-             /* OAM DMA: Start transfer (takes 160 M-cycles = 640 T-cycles) */
-             /* Prevent DMA from invalid regions if needed, but hardware allows it (reads FF/garbage) */
-             ctx->dma.source_high = value;
-             ctx->dma.progress = 0;
-             ctx->dma.cycles_remaining = 640;
-             ctx->dma.active = 1;
-             return;
-        }
-        if (addr == 0xFF02 && (value & 0x80)) {
-            printf("%c", ctx->io[0x01]); fflush(stdout);
-            ctx->io[0x0F] |= 0x08;
-        }
-        ctx->io[addr - 0xFF00] = value;
+    if (addr < GC_ROM_WINDOW_END) {
         return;
     }
-    if (addr < 0xFFFF) { 
-        // if (addr >= 0xFF80 && addr <= 0xFF8F) {
-        //      DBG_GENERAL("Writing to HRAM[%04X]: %02X", addr, value);
-        // }
-        ctx->hram[addr - 0xFF80] = value; return; 
+    if (addr < 0xE000) {
+        ctx->vram[addr - 0xA000] = value;
+        return;
     }
-    if (addr == 0xFFFF) { ctx->io[0x80] = value; return; }
+    if (addr <= 0xFFFF) {
+        size_t offset = addr - 0xE000;
+        if (ctx->eram && offset < ctx->eram_size) {
+            ctx->eram[offset] = value;
+        }
+        return;
+    }
 }
 
 uint16_t gb_read16(GBContext* ctx, uint16_t addr) {

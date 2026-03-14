@@ -246,10 +246,6 @@ struct AnalysisState {
  */
 static std::set<uint8_t> detect_bank_values(const ROM& rom) {
     std::set<uint8_t> banks;
-    banks.insert(0);  // Bank 0 is always present
-    banks.insert(1);  // Bank 1 is the default switchable bank
-    
-    // Use ROM header to know how many banks exist
     uint16_t bank_count = rom.header().rom_banks;
     for (uint16_t i = 0; i < bank_count && i < 256; i++) {
         banks.insert(static_cast<uint8_t>(i));
@@ -262,7 +258,7 @@ static std::set<uint8_t> detect_bank_values(const ROM& rom) {
  * @brief Calculate Shannon entropy of a memory region
  */
 static double calculate_entropy(const ROM& rom, uint8_t bank, uint16_t addr, size_t len) {
-    if (addr + len > 0x8000) return 0.0;
+    if (!rom.is_visible_rom_address(addr) || addr + len > rom.visible_rom_end()) return 0.0;
     
     uint32_t counts[256] = {0};
     for (size_t i = 0; i < len; i++) {
@@ -297,7 +293,7 @@ static int is_likely_valid_code(const ROM& rom, uint8_t bank, uint16_t addr) {
 
     // 2. Check for repetitive patterns (e.g. tile data)
     const int PATTERN_CHECK_LEN = 128;
-    if (addr + PATTERN_CHECK_LEN < 0x8000) {
+    if (addr + PATTERN_CHECK_LEN < rom.visible_rom_end()) {
         for (int period = 1; period <= 8; period++) {
             const int REQUIRED_REPEATS = 16;
             const int REQUIRED_LEN = period * REQUIRED_REPEATS;
@@ -340,10 +336,7 @@ static int is_likely_valid_code(const ROM& rom, uint8_t bank, uint16_t addr) {
             
             uint16_t imm = (instr.type == InstructionType::JR_N || instr.type == InstructionType::JR_CC_N) ? 0 : instr.imm16;
             if (imm != 0) {
-                // Prohibited memory areas
-                if (imm >= 0xFEA0 && imm <= 0xFEFF) return 0;
-                // Echo RAM (usually not used by real code)
-                if (imm >= 0xE000 && imm <= 0xFDFF) return 0;
+                if (imm >= arch::GC_VRAM_START && imm < arch::GC_EXT_RAM_END) return 0;
             }
         }
 
@@ -379,7 +372,7 @@ static int is_likely_valid_code(const ROM& rom, uint8_t bank, uint16_t addr) {
         }
         
         curr += instr.length;
-        if (curr >= 0x8000) return 0;
+        if (curr >= rom.visible_rom_end()) return 0;
         instructions_checked++;
         
         // High density of loads (indicative of data or large tables)
@@ -393,22 +386,18 @@ static int is_likely_valid_code(const ROM& rom, uint8_t bank, uint16_t addr) {
  * @brief Scan for 16-bit pointers that likely lead to code
  */
 static void find_pointer_entry_points(const ROM& rom, AnalysisResult& result, std::queue<AnalysisState>& work_queue) {
-    // Scan Bank 0 for potential 16-bit pointers
-    // Typically pointers are found after the header (0x150)
-    for (uint16_t addr = 0x0150; addr < 0x3FFE; addr++) {
+    for (uint16_t addr = arch::GC_RESET_ENTRY; addr + 1 < rom.visible_rom_end(); addr++) {
         uint8_t lo = rom.read_banked(0, addr);
         uint8_t hi = rom.read_banked(0, addr + 1);
         uint16_t target = lo | (hi << 8);
-        
-        // Target must be in ROM
-        if (target >= 0x0150 && target < 0x8000) {
-            uint8_t tbank = (target < 0x4000) ? 0 : 1; 
-            // If it's a pointer to code, suggest it as an entry point
+
+        if (rom.is_visible_rom_address(target)) {
+            uint8_t tbank = 0;
             if (is_likely_valid_code(rom, tbank, target)) {
                 uint32_t full_addr = make_address(tbank, target);
                 if (result.call_targets.find(full_addr) == result.call_targets.end()) {
                     result.call_targets.insert(full_addr);
-                    work_queue.push({full_addr, -1, -1, -1, -1, -1, -1, -1, (tbank > 0 ? tbank : (uint8_t)1)});
+                    work_queue.push({full_addr, -1, -1, -1, -1, -1, -1, -1, tbank});
                 }
             }
         }
@@ -452,10 +441,7 @@ static void load_trace_entry_points(const std::string& path, std::set<uint32_t>&
 AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     AnalysisResult result;
     result.rom = &rom;
-    result.entry_point = 0x100;
-    
-    // Add standard GameBoy entry points
-    result.interrupt_vectors = {0x40, 0x48, 0x50, 0x58, 0x60};  // Interrupt vectors
+    result.entry_point = rom.main_entry();
     
     Decoder decoder(rom);
     
@@ -467,20 +453,16 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     // Pointer scanning pass
     find_pointer_entry_points(rom, result, work_queue);
     
-    // Entry point is always a function (bank 0)
-    result.call_targets.insert(make_address(0, 0x100));
-    
-    // RST vectors
-    bool skip_rst30 = rst28_uses_rst30(rom);
-    for (uint16_t vec : {0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38}) {
-        if (is_rst_padding(rom, vec)) continue;
-        if (vec == 0x30 && skip_rst30) continue;
-        result.call_targets.insert(make_address(0, vec));
-    }
-    
-    // Interrupt vectors
-    for (uint16_t vec : result.interrupt_vectors) {
-        result.call_targets.insert(make_address(0, vec));
+    result.call_targets.insert(make_address(0, rom.main_entry()));
+
+    for (uint16_t vec_addr = arch::GC_VECTOR_TABLE_START;
+         vec_addr + 1 < arch::GC_VECTOR_TABLE_END;
+         vec_addr += 2) {
+        uint16_t target = static_cast<uint16_t>(rom.read_banked(0, vec_addr)) |
+                          (static_cast<uint16_t>(rom.read_banked(0, vec_addr + 1)) << 8);
+        if (!rom.is_visible_rom_address(target)) continue;
+        result.interrupt_vectors.push_back(target);
+        result.call_targets.insert(make_address(0, target));
     }
 
     // Load from trace if provided
@@ -489,7 +471,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     // Initial work queue seeding
     for (uint32_t target : result.call_targets) {
         uint8_t bank = get_bank(target);
-        work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, (bank > 0 ? bank : (uint8_t)1)});
+        work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, bank});
     }
     
     // Manual entry points
@@ -497,22 +479,17 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         if (result.call_targets.find(target) == result.call_targets.end()) {
             result.call_targets.insert(target);
             uint8_t bank = get_bank(target);
-            work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, (bank > 0 ? bank : (uint8_t)1)});
+            work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, bank});
         }
     }
-    
-    // For MBC games
-    if (rom.header().mbc_type != MBCType::NONE && options.analyze_all_banks) {
+
+    if (options.analyze_all_banks) {
         std::cerr << "Analyzing all " << known_banks.size() << " banks\n";
         for (uint8_t bank : known_banks) {
-                if (bank > 0) {
-                    if (is_likely_valid_code(rom, bank, 0x4000)) {
-                        work_queue.push({make_address(bank, 0x4000), -1, -1, -1, -1, -1, -1, -1, bank});
-                        result.call_targets.insert(make_address(bank, 0x4000));
-                    } else {
-                        // std::cout << "[INFO] Skipping likely data bank " << (int)bank << " at 0x4000\n";
-                    }
-                }
+            if (is_likely_valid_code(rom, bank, arch::GC_ROM_WINDOW_START)) {
+                work_queue.push({make_address(bank, arch::GC_ROM_WINDOW_START), -1, -1, -1, -1, -1, -1, -1, bank});
+                result.call_targets.insert(make_address(bank, arch::GC_ROM_WINDOW_START));
+            }
         }
     }
     
@@ -520,15 +497,14 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     for (const auto& ov : options.ram_overlays) {
         uint32_t addr = make_address(0, ov.ram_addr);
         result.call_targets.insert(addr);
-        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, 1});
+        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, 0});
     }
 
     // Add manual entry points
     for (uint32_t addr : options.entry_points) {
         result.call_targets.insert(addr);
         uint8_t bank = get_bank(addr);
-        uint8_t context = (bank > 0) ? bank : 1;
-        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, context});
+        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, bank});
     }
     
     // Multi-pass analysis
@@ -565,36 +541,20 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             }
         }
         
-        // Only analyze ROM space or RAM overlays
-        if (offset >= 0x8000 && !overlay) continue;
-        
-        // Bank mapping rules
-        if (offset < 0x4000) {
-            bank = 0;  // Force bank 0 for this region
-            addr = make_address(0, offset);
-            if (visited.count(addr)) continue;
-        } else if (offset < 0x8000 && bank == 0) {
-            bank = 1;  // Default to bank 1
-            addr = make_address(1, offset);
-            if (visited.count(addr)) continue;
-        } else if (overlay) {
-             if (visited.count(addr)) continue;
-        }
-        
-        if (bank > 0) current_switchable_bank = bank;
+        if (!rom.is_visible_rom_address(offset) && !overlay) continue;
+        if (overlay && visited.count(addr)) continue;
+
+        current_switchable_bank = bank;
         
         // Calculate ROM offset
         size_t rom_offset;
         if (overlay) {
             uint8_t src_bank = get_bank(overlay->rom_addr);
             uint16_t src_addr = get_offset(overlay->rom_addr);
-            if (src_addr < 0x4000) rom_offset = src_addr;
-            else rom_offset = static_cast<size_t>(src_bank) * 0x4000 + (src_addr - 0x4000);
+            rom_offset = arch::rom_offset_for_bank_address(src_bank, src_addr);
             rom_offset += (offset - overlay->ram_addr);
-        } else if (offset < 0x4000) {
-            rom_offset = offset;
         } else {
-            rom_offset = static_cast<size_t>(bank) * 0x4000 + (offset - 0x4000);
+            rom_offset = arch::rom_offset_for_bank_address(bank, offset);
         }
         if (rom_offset >= rom.size()) continue;
         
@@ -646,7 +606,9 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             if (regs[dst]) {
                 if (src == 6) { // LD r, (HL)
                     int mhl = get_known_hl();
-                    if (mhl != -1 && mhl < 0x8000) *regs[dst] = rom.read_banked(mhl < 0x4000 ? 0 : bank, mhl);
+                    if (mhl != -1 && rom.is_visible_rom_address(static_cast<uint16_t>(mhl))) {
+                        *regs[dst] = rom.read_banked(bank, static_cast<uint16_t>(mhl));
+                    }
                     else *regs[dst] = -1;
                 } else if (regs[src]) *regs[dst] = *regs[src];
                 else *regs[dst] = -1;
@@ -724,8 +686,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         result.addr_to_index[addr] = idx;
         
         auto target_bank = [&](uint16_t target) -> uint8_t {
-            if (target < 0x4000) return 0;
-            if (rom.header().mbc_type == MBCType::NONE) return 1;
+            if (!rom.is_visible_rom_address(target)) return 0;
             return current_switchable_bank;
         };
         
@@ -778,7 +739,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                 uint16_t target = instr.imm16;
                 uint8_t tbank = target_bank(target);
                 instr.resolved_target_bank = tbank;
-                if (target >= 0x4000 && target <= 0x7FFF) {
+                if (rom.is_visible_rom_address(target)) {
                     if (tbank > 0 && tbank != bank) {
                         if (!is_likely_valid_code(rom, tbank, target)) continue;
                     }
@@ -815,7 +776,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                                 uint8_t lo = rom.read(entry_addr);
                                 uint8_t hi = rom.read(entry_addr + 1);
                                 uint16_t target = lo | (hi << 8);
-                                if (target >= 0x0100 && target < 0x8000) {
+                                if (rom.is_visible_rom_address(target)) {
                                     uint8_t tbank = target_bank(target);
                                     if (is_likely_valid_code(rom, tbank, target)) {
                                         result.call_targets.insert(make_address(tbank, target));
@@ -865,8 +826,8 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         static std::set<uint32_t> aggressive_regions; 
 
         for (uint8_t bank : banks_to_scan) {
-            uint16_t start_addr = (bank == 0) ? 0x0000 : 0x4000;
-            uint16_t end_addr = (bank == 0) ? 0x3FFF : 0x7FFF;
+            uint16_t start_addr = arch::GC_ROM_WINDOW_START;
+            uint16_t end_addr = static_cast<uint16_t>(rom.visible_rom_end() - 1);
             
             for (uint32_t addr = start_addr; addr <= end_addr; ) {
                 uint32_t full_addr = make_address(bank, addr);
@@ -898,8 +859,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                     result.call_targets.insert(entry);
                     
                     // Add to queue
-                    uint8_t context = (bank > 0) ? bank : 1;
-                    work_queue.push({entry, -1, -1, -1, -1, -1, -1, -1, context});
+                    work_queue.push({entry, -1, -1, -1, -1, -1, -1, -1, bank});
                     found_count++;
                     
                     // Mark region as scanned
@@ -1077,9 +1037,9 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         
         // If function is too small and not a special entry point, consider merging
         bool is_special_entry = (func.bank == 0 && (
-            func.entry_address == 0x100 || // main entry
-            (func.entry_address >= 0x00 && func.entry_address <= 0x38) || // RST vectors
-            (func.entry_address >= 0x40 && func.entry_address <= 0x60) // interrupt vectors
+            func.entry_address == arch::GC_RESET_ENTRY ||
+            (func.entry_address >= arch::GC_VECTOR_TABLE_START &&
+             func.entry_address < arch::GC_VECTOR_TABLE_END)
         ));
         
         if (total_instrs < MIN_FUNCTION_SIZE && !is_special_entry) {
@@ -1118,23 +1078,13 @@ AnalysisResult analyze_bank(const ROM& rom, uint8_t bank, const AnalyzerOptions&
 std::string generate_function_name(uint8_t bank, uint16_t address) {
     std::ostringstream ss;
     
-    // Check for known GameBoy entry points
     if (bank == 0) {
         switch (address) {
-            case 0x0000: return "rst_00";
-            case 0x0008: return "rst_08";
-            case 0x0010: return "rst_10";
-            case 0x0018: return "rst_18";
-            case 0x0020: return "rst_20";
-            case 0x0028: return "rst_28";
-            case 0x0030: return "rst_30";
-            case 0x0038: return "rst_38";
-            case 0x0040: return "int_vblank";
-            case 0x0048: return "int_lcd_stat";
-            case 0x0050: return "int_timer";
-            case 0x0058: return "int_serial";
-            case 0x0060: return "int_joypad";
-            case 0x0100: return "gb_main";  // Avoid shadowing C main()
+            case arch::GC_RESET_ENTRY: return "gc_main";
+        }
+        if (address >= arch::GC_VECTOR_TABLE_START && address < arch::GC_VECTOR_TABLE_END) {
+            ss << "irq_vector_" << std::hex << std::setfill('0') << std::setw(4) << address;
+            return ss.str();
         }
     }
     

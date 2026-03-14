@@ -76,34 +76,8 @@ public:
             std::cout << "\nAnalyzing control flow...\n";
         }
         
-        // Detect standard HRAM DMA routine
-        // Routine: LDH (46),A; LD A,28; DEC A; JR NZ,-3; RET
-        // Hex: E0 46 3E 28 3D 20 FD C9
         AnalyzerOptions analyzer_opts;
-        // analyzer_opts.verbose = opts_.verbose; // analyzer options doesn't have verbose
-        analyzer_opts.trace_log = false; // can be enabled if needed
-        
-        const std::vector<uint8_t> pattern = {0xE0, 0x46, 0x3E, 0x28, 0x3D, 0x20, 0xFD, 0xC9};
-        const std::vector<uint8_t>& data = rom.bytes();
-        
-        auto it = std::search(data.begin(), data.end(), pattern.begin(), pattern.end());
-        if (it != data.end()) {
-             size_t rom_idx = std::distance(data.begin(), it);
-             uint8_t bank = rom_idx / 0x4000;
-             uint16_t offset = rom_idx % 0x4000;
-             if (bank > 0) offset += 0x4000;
-            
-             if (opts_.verbose) {
-                 std::cout << "Detected OAM DMA routine at ROM 0x" << std::hex << rom_idx 
-                           << " (Bank " << (int)bank << ":0x" << offset << "). Mapping to HRAM 0xFF80.\n" << std::dec;
-             }
-             
-             AnalyzerOptions::RamOverlay overlay;
-             overlay.ram_addr = 0xFF80;
-             overlay.rom_addr = AnalysisResult::make_addr(bank, offset);
-             overlay.size = 8;
-             analyzer_opts.ram_overlays.push_back(overlay);
-        }
+           analyzer_opts.trace_log = false;
 
         // Use free function analyze() instead of Analyzer class
         AnalysisResult analysis = analyze(rom, analyzer_opts);

@@ -1550,7 +1550,6 @@ GeneratedOutput generate_output(const ir::Program& program,
     source_ss << "    while (!ctx->stopped && !ctx->halted) {\n";
     source_ss << "        addr = ctx->pc;\n";
     source_ss << "        uint8_t bank = ctx->rom_bank;\n";
-    source_ss << "        if (addr < 0x4000) bank = 0;\n";
         
     /* Debug checks in dispatch loop */
     source_ss << "        if (gbrt_instruction_limit > 0 && gbrt_instruction_count >= gbrt_instruction_limit) {\n";
@@ -1640,8 +1639,7 @@ GeneratedOutput generate_output(const ir::Program& program,
         funcs.erase(last, funcs.end());
 
         source_ss << "            case 0x" << std::hex << std::setfill('0') << std::setw(4) << addr << std::dec << ":\n";
-        // Check if bank validation is required (allocatable space >= 0x4000)
-        bool validation_needed = (addr >= 0x4000);
+        bool validation_needed = (addr >= 0x1000 && addr < 0xA000);
         
         if (funcs.size() == 1 && !validation_needed) {
             const auto& entry = funcs[0];
@@ -1909,8 +1907,12 @@ GeneratedOutput generate_output(const ir::Program& program,
     source_ss << "void " << options.output_prefix << "_init(GBContext* ctx) {\n";
     source_ss << "    /* Load ROM data into context */\n";
     source_ss << "    gb_context_load_rom(ctx, rom_data, " << rom_size << ");\n";
-    source_ss << "    /* Set MBC type from header */\n";
-    source_ss << "    ctx->mbc_type = rom_data[0x147];\n";
+    source_ss << "    ctx->rom_bank = 0;\n";
+    source_ss << "    ctx->mmu[0] = 0;\n";
+    source_ss << "    ctx->mmu[1] = 1;\n";
+    source_ss << "    ctx->mmu[2] = 2;\n";
+    source_ss << "    ctx->mmu[3] = 3;\n";
+    source_ss << "    ctx->mmu[4] = 4;\n";
     source_ss << "}\n\n";
     
     source_ss << "void " << options.output_prefix << "_run(GBContext* ctx) {\n";
