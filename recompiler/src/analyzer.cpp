@@ -32,12 +32,21 @@ static uint16_t get_offset(uint32_t addr) {
     return static_cast<uint16_t>(addr & 0xFFFF);
 }
 
+static std::array<uint8_t, 5> to_mmu_array(const uint8_t mmu[5]) {
+    return {mmu[0], mmu[1], mmu[2], mmu[3], mmu[4]};
+}
+
+static AnalysisResult::ContextKey make_context_key(uint8_t bank, uint16_t addr, const uint8_t mmu[5]) {
+    return AnalysisResult::make_context_addr(bank, addr, to_mmu_array(mmu));
+}
+
 /* ============================================================================
  * AnalysisResult Implementation
  * ========================================================================== */
 
-const Instruction* AnalysisResult::get_instruction(uint8_t bank, uint16_t addr) const {
-    uint32_t full_addr = make_addr(bank, addr);
+const Instruction* AnalysisResult::get_instruction(uint8_t bank, uint16_t addr,
+                                                   const std::array<uint8_t, 5>& mmu) const {
+    ContextKey full_addr = make_context_addr(bank, addr, mmu);
     auto it = addr_to_index.find(full_addr);
     if (it != addr_to_index.end() && it->second < instructions.size()) {
         return &instructions[it->second];
@@ -45,8 +54,9 @@ const Instruction* AnalysisResult::get_instruction(uint8_t bank, uint16_t addr) 
     return nullptr;
 }
 
-const BasicBlock* AnalysisResult::get_block(uint8_t bank, uint16_t addr) const {
-    uint32_t full_addr = make_addr(bank, addr);
+const BasicBlock* AnalysisResult::get_block(uint8_t bank, uint16_t addr,
+                                            const std::array<uint8_t, 5>& mmu) const {
+    ContextKey full_addr = make_context_addr(bank, addr, mmu);
     auto it = blocks.find(full_addr);
     if (it != blocks.end()) {
         return &it->second;
@@ -54,8 +64,9 @@ const BasicBlock* AnalysisResult::get_block(uint8_t bank, uint16_t addr) const {
     return nullptr;
 }
 
-const Function* AnalysisResult::get_function(uint8_t bank, uint16_t addr) const {
-    uint32_t full_addr = make_addr(bank, addr);
+const Function* AnalysisResult::get_function(uint8_t bank, uint16_t addr,
+                                             const std::array<uint8_t, 5>& mmu) const {
+    ContextKey full_addr = make_context_addr(bank, addr, mmu);
     auto it = functions.find(full_addr);
     if (it != functions.end()) {
         return &it->second;
@@ -240,7 +251,8 @@ static int is_likely_valid_code(const ROM& rom, uint8_t bank, uint16_t addr) {
 /**
  * @brief Scan for 16-bit pointers that likely lead to code
  */
-static void find_pointer_entry_points(const ROM& rom, AnalysisResult& result, std::queue<AnalysisState>& work_queue) {
+static void find_pointer_entry_points(const ROM& rom, AnalysisResult& result,
+                                      std::queue<AnalysisState>& work_queue) {
     for (uint16_t addr = arch::GC_RESET_ENTRY; addr + 1 < rom.visible_rom_end(); addr++) {
         uint8_t lo = rom.read_banked(0, addr);
         uint8_t hi = rom.read_banked(0, addr + 1);
@@ -249,10 +261,11 @@ static void find_pointer_entry_points(const ROM& rom, AnalysisResult& result, st
         if (rom.is_visible_rom_address(target)) {
             uint8_t tbank = 0;
             if (is_likely_valid_code(rom, tbank, target)) {
-                uint32_t full_addr = make_address(tbank, target);
+                const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+                auto full_addr = make_context_key(tbank, target, identity_mmu);
                 if (result.call_targets.find(full_addr) == result.call_targets.end()) {
                     result.call_targets.insert(full_addr);
-                    work_queue.push(make_state(full_addr));
+                    work_queue.push(make_state(make_address(tbank, target)));
                 }
             }
         }
@@ -266,7 +279,8 @@ static void find_pointer_entry_points(const ROM& rom, AnalysisResult& result, st
 /**
  * @brief Load entry points from a runtime trace file
  */
-static void load_trace_entry_points(const std::string& path, std::set<uint32_t>& call_targets) {
+static void load_trace_entry_points(const std::string& path,
+                                    std::set<AnalysisResult::ContextKey>& call_targets) {
     if (path.empty()) return;
 
     std::ifstream file(path);
@@ -283,7 +297,10 @@ static void load_trace_entry_points(const std::string& path, std::set<uint32_t>&
             try {
                 int bank = std::stoi(line.substr(0, colon));
                 int addr = std::stoi(line.substr(colon + 1), nullptr, 16);
-                call_targets.insert(make_address(bank, addr));
+                const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+                call_targets.insert(make_context_key(static_cast<uint8_t>(bank),
+                                                     static_cast<uint16_t>(addr),
+                                                     identity_mmu));
                 count++;
             } catch (...) {
                 continue;
@@ -304,11 +321,14 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     std::set<uint8_t> known_banks = detect_bank_values(rom);
     
     std::queue<AnalysisState> work_queue;
-    std::set<uint32_t> visited;
+    std::set<AnalysisResult::ContextKey> visited;
     // Pointer scanning pass
     find_pointer_entry_points(rom, result, work_queue);
     
-    result.call_targets.insert(make_address(0, rom.main_entry()));
+    {
+        const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+        result.call_targets.insert(make_context_key(0, rom.main_entry(), identity_mmu));
+    }
 
     for (uint16_t vec_addr = arch::GC_VECTOR_TABLE_START;
          vec_addr + 1 < arch::GC_VECTOR_TABLE_END;
@@ -317,21 +337,33 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                           (static_cast<uint16_t>(rom.read_banked(0, vec_addr + 1)) << 8);
         if (!rom.is_visible_rom_address(target)) continue;
         result.interrupt_vectors.push_back(target);
-        result.call_targets.insert(make_address(0, target));
+        const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+        result.call_targets.insert(make_context_key(0, target, identity_mmu));
     }
 
     // Load from trace if provided
     load_trace_entry_points(options.trace_file_path, result.call_targets);
 
     // Initial work queue seeding
-    for (uint32_t target : result.call_targets) {
-        work_queue.push(make_state(target));
+    for (auto target : result.call_targets) {
+        uint8_t bank = AnalysisResult::context_bank(target);
+        uint16_t off = AnalysisResult::context_offset(target);
+        AnalysisState state = make_state(make_address(bank, off));
+        auto mmu = AnalysisResult::context_mmu(target);
+        for (size_t i = 0; i < 5; i++) {
+            state.mmu[i] = mmu[i];
+        }
+        work_queue.push(state);
     }
     
     // Manual entry points
     for (uint32_t target : options.entry_points) {
-        if (result.call_targets.find(target) == result.call_targets.end()) {
-            result.call_targets.insert(target);
+        uint8_t bank = get_bank(target);
+        uint16_t off = get_offset(target);
+        const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+        auto key = make_context_key(bank, off, identity_mmu);
+        if (result.call_targets.find(key) == result.call_targets.end()) {
+            result.call_targets.insert(key);
             work_queue.push(make_state(target));
         }
     }
@@ -341,7 +373,8 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         for (uint8_t bank : known_banks) {
             if (is_likely_valid_code(rom, bank, arch::GC_ROM_WINDOW_START)) {
                 work_queue.push(make_state(make_address(bank, arch::GC_ROM_WINDOW_START)));
-                result.call_targets.insert(make_address(bank, arch::GC_ROM_WINDOW_START));
+                const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+                result.call_targets.insert(make_context_key(bank, arch::GC_ROM_WINDOW_START, identity_mmu));
             }
         }
     }
@@ -349,13 +382,17 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     // Add overlay entry points
     for (const auto& ov : options.ram_overlays) {
         uint32_t addr = make_address(0, ov.ram_addr);
-        result.call_targets.insert(addr);
+        const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+        result.call_targets.insert(make_context_key(0, ov.ram_addr, identity_mmu));
         work_queue.push(make_state(addr));
     }
 
     // Add manual entry points
     for (uint32_t addr : options.entry_points) {
-        result.call_targets.insert(addr);
+        uint8_t bank = get_bank(addr);
+        uint16_t off = get_offset(addr);
+        const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+        result.call_targets.insert(make_context_key(bank, off, identity_mmu));
         work_queue.push(make_state(addr));
     }
     
@@ -377,10 +414,10 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         // current_switchable_bank: derive from MMU window 0 (maps 0x1000-0x2FFF)
         uint8_t current_switchable_bank = current_mmu[0];
         
-        if (visited.count(addr)) continue;
-        
         uint8_t bank = get_bank(addr);
         uint16_t offset = get_offset(addr);
+        auto state_key = make_context_key(bank, offset, current_mmu);
+        if (visited.count(state_key)) continue;
         
         // Check if inside any RAM overlay
         const AnalyzerOptions::RamOverlay* overlay = nullptr;
@@ -392,7 +429,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         }
         
         if (!rom.is_visible_rom_address(offset) && !overlay) continue;
-        if (overlay && visited.count(addr)) continue;
+        if (overlay && visited.count(state_key)) continue;
 
         // Calculate ROM offset
         size_t rom_offset;
@@ -406,7 +443,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         }
         if (rom_offset >= rom.size()) continue;
         
-        visited.insert(addr);
+        visited.insert(state_key);
         
         // Decode instruction
         Instruction instr;
@@ -491,7 +528,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         
         size_t idx = result.instructions.size();
         result.instructions.push_back(instr);
-        result.addr_to_index[addr] = idx;
+        result.addr_to_index[state_key] = idx;
 
         AnalysisState base_state = item;
         for (int i = 0; i < 16; i++) base_state.known_r[i] = known_r[i];
@@ -511,7 +548,8 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                 if (!is_likely_valid_code(rom, tbank, target)) continue;
             }
 
-            result.call_targets.insert(make_address(tbank, target));
+            auto target_key = make_context_key(tbank, target, base_state.mmu);
+            result.call_targets.insert(target_key);
             work_queue.push(make_state(make_address(tbank, target)));
             
             if (tbank != bank) {
@@ -520,7 +558,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             }
             
             uint32_t fall_through = make_address(bank, offset + instr.length);
-            result.label_addresses.insert(fall_through);
+            result.label_addresses.insert(make_context_key(bank, static_cast<uint16_t>(offset + instr.length), base_state.mmu));
             work_queue.push(copy_state_with_addr(base_state, fall_through));
         } else if (instr.is_jump) {
             if (instr.type == InstructionType::JP_NN || instr.type == InstructionType::JPC_CC_NN) {
@@ -531,29 +569,29 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                     if (tbank > 0 && tbank != bank) {
                         if (!is_likely_valid_code(rom, tbank, target)) continue;
                     }
-                    result.call_targets.insert(make_address(tbank, target));
+                    result.call_targets.insert(make_context_key(tbank, target, base_state.mmu));
                 }
-                result.label_addresses.insert(make_address(tbank, target));
+                result.label_addresses.insert(make_context_key(tbank, target, base_state.mmu));
                 work_queue.push(copy_state_with_addr(base_state, make_address(tbank, target)));
             } else if (instr.type == InstructionType::JR_E || instr.type == InstructionType::JRC_CC_E ||
                        instr.type == InstructionType::DBNZ_R_E) {
                 uint16_t target = offset + instr.length + instr.offset;
-                result.label_addresses.insert(make_address(bank, target));
+                result.label_addresses.insert(make_context_key(bank, target, base_state.mmu));
                 work_queue.push(copy_state_with_addr(base_state, make_address(bank, target)));
             } else if (instr.type == InstructionType::JP_RR) {
                 // Indirect jump target unknown at analysis time.
-                result.computed_jump_targets.insert(make_address(bank, offset));
+                result.computed_jump_targets.insert(make_context_key(bank, offset, base_state.mmu));
             }
             
             if (instr.is_conditional) {
                 uint32_t fall_through = make_address(bank, offset + instr.length);
-                result.label_addresses.insert(fall_through);
+                result.label_addresses.insert(make_context_key(bank, static_cast<uint16_t>(offset + instr.length), base_state.mmu));
                 work_queue.push(copy_state_with_addr(base_state, fall_through));
             }
         } else if (instr.is_return) {
             if (instr.is_conditional) {
                 uint32_t fall_through = make_address(bank, offset + instr.length);
-                result.label_addresses.insert(fall_through);
+                result.label_addresses.insert(make_context_key(bank, static_cast<uint16_t>(offset + instr.length), base_state.mmu));
                 work_queue.push(copy_state_with_addr(base_state, fall_through));
             }
         } else {
@@ -583,7 +621,8 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             uint16_t end_addr = static_cast<uint16_t>(rom.visible_rom_end() - 1);
             
             for (uint32_t addr = start_addr; addr <= end_addr; ) {
-                uint32_t full_addr = make_address(bank, addr);
+                const uint8_t identity_mmu[5] = {0, 1, 2, 3, 4};
+                auto full_addr = make_context_key(bank, static_cast<uint16_t>(addr), identity_mmu);
                 
                 // If already visited by ANY means, skip
                 if (visited.count(full_addr) || aggressive_regions.count(full_addr)) {
@@ -609,7 +648,8 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                     
                     // Add as a new entry point
                     uint32_t entry = make_address(bank, addr);
-                    result.call_targets.insert(entry);
+                    auto entry_key = make_context_key(bank, static_cast<uint16_t>(addr), identity_mmu);
+                    result.call_targets.insert(entry_key);
                     
                     // Add to queue
                     work_queue.push(make_state(entry));
@@ -642,22 +682,24 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     } // End while(true)
     
     // Build basic blocks from instruction boundaries
-    std::set<uint32_t> block_starts;
+    std::set<AnalysisResult::ContextKey> block_starts;
     
-    for (uint32_t target : result.call_targets) {
+    for (auto target : result.call_targets) {
         block_starts.insert(target);
     }
-    for (uint32_t target : result.label_addresses) {
+    for (auto target : result.label_addresses) {
         block_starts.insert(target);
     }
     
     // Create blocks
-    for (uint32_t start : block_starts) {
+    for (auto start : block_starts) {
         if (!visited.count(start)) continue;
         
         BasicBlock block;
-        block.start_address = get_offset(start);
-        block.bank = get_bank(start);
+        block.context_key = start;
+        block.start_address = AnalysisResult::context_offset(start);
+        block.bank = AnalysisResult::context_bank(start);
+        block.mmu_state = AnalysisResult::context_mmu(start);
         block.is_reachable = true;
         
         if (result.call_targets.count(start)) {
@@ -665,9 +707,12 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         }
         
         // Find instructions in this block
-        uint32_t curr = start;
-        while (visited.count(curr)) {
-            auto it = result.addr_to_index.find(curr);
+        uint32_t curr = make_address(block.bank, block.start_address);
+        while (true) {
+            auto curr_key = make_context_key(block.bank, get_offset(curr), block.mmu_state.data());
+            if (!visited.count(curr_key)) break;
+
+            auto it = result.addr_to_index.find(curr_key);
             if (it == result.addr_to_index.end()) break;
             
             block.instruction_indices.push_back(it->second);
@@ -679,35 +724,46 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             if (instr.is_jump) {
                 if (instr.type == InstructionType::JP_NN || instr.type == InstructionType::JPC_CC_NN) {
                     block.successors.push_back(instr.imm16);
+                    uint8_t succ_bank = (instr.resolved_target_bank == 0xFF) ? block.bank : instr.resolved_target_bank;
+                    block.successor_keys.push_back(make_context_key(succ_bank, instr.imm16, block.mmu_state.data()));
                 } else if (instr.type == InstructionType::JR_E || instr.type == InstructionType::JRC_CC_E ||
                            instr.type == InstructionType::DBNZ_R_E) {
                     uint16_t target = get_offset(curr) + instr.length + instr.offset;
                     block.successors.push_back(target);
+                    block.successor_keys.push_back(make_context_key(block.bank, target, block.mmu_state.data()));
                 }
                 // Conditional jumps also fall through
                 if (instr.is_conditional) {
-                    block.successors.push_back(get_offset(curr) + instr.length);
+                    uint16_t fallthrough = get_offset(curr) + instr.length;
+                    block.successors.push_back(fallthrough);
+                    block.successor_keys.push_back(make_context_key(block.bank, fallthrough, block.mmu_state.data()));
                 }
             } else if (instr.is_return && instr.is_conditional) {
                 // Conditional returns fall through if condition is false
-                block.successors.push_back(get_offset(curr) + instr.length);
+                uint16_t fallthrough = get_offset(curr) + instr.length;
+                block.successors.push_back(fallthrough);
+                block.successor_keys.push_back(make_context_key(block.bank, fallthrough, block.mmu_state.data()));
             }
             
             // Check if this ends the block
             if (instr.is_jump || instr.is_return || instr.is_call) {
                 // CALLs fall through to next instruction after return
                 if (instr.is_call) {
-                    block.successors.push_back(get_offset(curr) + instr.length);
+                    uint16_t fallthrough = get_offset(curr) + instr.length;
+                    block.successors.push_back(fallthrough);
+                    block.successor_keys.push_back(make_context_key(block.bank, fallthrough, block.mmu_state.data()));
                 }
                 break;
             }
             
             curr = make_address(block.bank, get_offset(curr) + instr.length);
+            auto next_key = make_context_key(block.bank, get_offset(curr), block.mmu_state.data());
             
             // Check if next instruction starts a new block
-            if (block_starts.count(curr)) {
+            if (block_starts.count(next_key)) {
                 // Fall through to the new block - add as successor
                 block.successors.push_back(get_offset(curr));
+                block.successor_keys.push_back(next_key);
                 break;
             }
         }
@@ -716,30 +772,32 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     }
     
     // Create functions from call targets with better merging logic
-    std::set<uint32_t> processed_targets;
+    std::set<AnalysisResult::ContextKey> processed_targets;
     
     // Function size threshold for merging (in instructions)
     const int MIN_FUNCTION_SIZE = 3;
     
-    for (uint32_t target : result.call_targets) {
+    for (auto target : result.call_targets) {
         if (processed_targets.count(target)) continue;
         
         auto block_it = result.blocks.find(target);
         if (block_it == result.blocks.end()) continue;
         
         Function func;
-        func.name = generate_function_name(get_bank(target), get_offset(target));
-        func.entry_address = get_offset(target);
-        func.bank = get_bank(target);
-        func.block_addresses.push_back(get_offset(target));
+        func.context_key = target;
+        func.entry_address = AnalysisResult::context_offset(target);
+        func.bank = AnalysisResult::context_bank(target);
+        func.mmu_state = AnalysisResult::context_mmu(target);
+        func.name = generate_function_name(func.bank, func.entry_address, func.mmu_state);
+        func.block_addresses.push_back(target);
         
         // Add all blocks reachable from this function (simple DFS)
-        std::queue<uint32_t> func_queue;
-        std::set<uint32_t> func_visited;
+        std::queue<AnalysisResult::ContextKey> func_queue;
+        std::set<AnalysisResult::ContextKey> func_visited;
         func_queue.push(target);
         
         while (!func_queue.empty()) {
-            uint32_t block_addr = func_queue.front();
+            auto block_addr = func_queue.front();
             func_queue.pop();
             
             if (func_visited.count(block_addr)) continue;
@@ -750,7 +808,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             
             // Add this block to function if not already there
             if (block_addr != target) {
-                func.block_addresses.push_back(get_offset(block_addr));
+                func.block_addresses.push_back(block_addr);
             }
             
             // Mark all reachable call targets as processed to avoid creating separate functions
@@ -759,8 +817,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             }
             
             // Follow successors
-            for (uint16_t succ : blk->second.successors) {
-                uint32_t succ_addr = make_address(blk->second.bank, succ);
+            for (auto succ_addr : blk->second.successor_keys) {
                 if (!func_visited.count(succ_addr)) {
                     func_queue.push(succ_addr);
                 }
@@ -773,17 +830,16 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     
     // Post-process: Merge very small functions into their callers
     // This reduces the number of single-instruction functions
-    std::map<uint32_t, Function> merged_functions = result.functions;
-    std::set<uint32_t> functions_to_remove;
+    std::map<AnalysisResult::ContextKey, Function> merged_functions = result.functions;
+    std::set<AnalysisResult::ContextKey> functions_to_remove;
     
     for (const auto& [func_addr, func] : result.functions) {
         if (functions_to_remove.count(func_addr)) continue;
         
         // Calculate total number of instructions in function
         int total_instrs = 0;
-        for (uint16_t block_addr : func.block_addresses) {
-            uint32_t full_blk_addr = make_address(func.bank, block_addr);
-            auto blk_it = result.blocks.find(full_blk_addr);
+        for (auto block_addr : func.block_addresses) {
+            auto blk_it = result.blocks.find(block_addr);
             if (blk_it != result.blocks.end()) {
                 total_instrs += blk_it->second.instruction_indices.size();
             }
@@ -802,7 +858,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     }
     
     // Remove small functions
-    for (uint32_t func_addr : functions_to_remove) {
+    for (auto func_addr : functions_to_remove) {
         merged_functions.erase(func_addr);
         // Also remove from call_targets so they don't get re-created
         result.call_targets.erase(func_addr);
@@ -830,14 +886,30 @@ AnalysisResult analyze_bank(const ROM& rom, uint8_t bank, const AnalyzerOptions&
  * ========================================================================== */
 
 std::string generate_function_name(uint8_t bank, uint16_t address) {
+    const std::array<uint8_t, 5> identity = {0, 1, 2, 3, 4};
+    return generate_function_name(bank, address, identity);
+}
+
+std::string generate_function_name(uint8_t bank, uint16_t address,
+                                   const std::array<uint8_t, 5>& mmu_state) {
     std::ostringstream ss;
     
     if (bank == 0) {
         switch (address) {
-            case arch::GC_RESET_ENTRY: return "gc_main";
+            case arch::GC_RESET_ENTRY:
+                if (mmu_state == std::array<uint8_t, 5>{0, 1, 2, 3, 4}) {
+                    return "gc_main";
+                }
+                break;
         }
         if (address >= arch::GC_VECTOR_TABLE_START && address < arch::GC_VECTOR_TABLE_END) {
-            ss << "irq_vector_" << std::hex << std::setfill('0') << std::setw(4) << address;
+            ss << "irq_vector_" << std::hex << std::setfill('0') << std::setw(4) << address
+               << "_m"
+               << std::setw(2) << (int)mmu_state[0]
+               << std::setw(2) << (int)mmu_state[1]
+               << std::setw(2) << (int)mmu_state[2]
+               << std::setw(2) << (int)mmu_state[3]
+               << std::setw(2) << (int)mmu_state[4];
             return ss.str();
         }
     }
@@ -846,7 +918,13 @@ std::string generate_function_name(uint8_t bank, uint16_t address) {
     if (bank > 0) {
         ss << std::hex << std::setfill('0') << std::setw(2) << (int)bank << "_";
     }
-    ss << std::hex << std::setfill('0') << std::setw(4) << address;
+    ss << std::hex << std::setfill('0') << std::setw(4) << address
+       << "_m"
+       << std::setw(2) << (int)mmu_state[0]
+       << std::setw(2) << (int)mmu_state[1]
+       << std::setw(2) << (int)mmu_state[2]
+       << std::setw(2) << (int)mmu_state[3]
+       << std::setw(2) << (int)mmu_state[4];
     return ss.str();
 }
 
@@ -881,7 +959,8 @@ void print_analysis_summary(const AnalysisResult& result) {
 }
 
 bool is_likely_data(const AnalysisResult& result, uint8_t bank, uint16_t address) {
-    uint32_t full_addr = AnalysisResult::make_addr(bank, address);
+    std::array<uint8_t, 5> identity = {0, 1, 2, 3, 4};
+    auto full_addr = AnalysisResult::make_context_addr(bank, address, identity);
     return result.addr_to_index.find(full_addr) == result.addr_to_index.end();
 }
 

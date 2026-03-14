@@ -22,6 +22,7 @@
 #define RECOMPILER_IR_H
 
 #include "recompiler/architecture.h"
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -326,6 +327,8 @@ struct Function {
     std::string name;
     uint8_t  bank          = 0;
     uint16_t entry_address = 0;
+    std::array<uint8_t, 5> mmu_state = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint64_t context_key = 0;
 
     std::vector<uint32_t> block_ids;
 
@@ -361,12 +364,16 @@ struct Program {
     uint16_t main_entry = arch::GC_RESET_ENTRY;
     std::vector<uint16_t> interrupt_vectors;
 
-    uint32_t create_block(uint8_t bank, uint16_t addr);
+    uint32_t create_block(uint8_t bank, uint16_t addr,
+                          const std::array<uint8_t, 5>& mmu_state = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF});
     uint32_t create_label(const std::string& name);
     uint32_t get_or_create_label(const std::string& name);
     std::string get_label_name(uint32_t id) const;
-    std::string make_address_label(uint8_t bank, uint16_t addr) const;
+    std::string make_address_label(uint8_t bank, uint16_t addr,
+                                   const std::array<uint8_t, 5>& mmu_state = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF}) const;
     std::string make_function_name(uint8_t bank, uint16_t addr) const;
+    std::string make_function_name(uint8_t bank, uint16_t addr,
+                                   const std::array<uint8_t, 5>& mmu_state) const;
 };
 
 /* ============================================================================

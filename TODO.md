@@ -24,10 +24,12 @@ Completed in this session:
 - Removed legacy GB `RST` pattern logic from `recompiler/src/analyzer.cpp` and switched analysis queue state to `known_r[16] + mmu[5]`.
 - Updated jump/call analysis paths to use new SM85 instruction names (`JPC_CC_NN`, `JR_E`, `JRC_CC_E`, `DBNZ_R_E`, `JP_RR`).
 - Began runtime header migration in `runtime/include/gbrt.h` by introducing `SM85Context` and game.com config/model types while keeping compatibility aliases.
+- Made analyzer function/block identity MMU-context-aware by keying analysis artifacts on `(bank, addr, mmu[0..4])` and preserving MMU signatures in generated function names.
+- Threaded MMU context metadata into IR block/function construction so multiple contexts at the same ROM address can survive past analysis.
 
 Still remaining after this session:
 
-- Deep analyzer/MMU identity work is still incomplete (function identity is still bank/address keyed, not full MMU-state keyed).
+- Deep analyzer/MMU identity work is still incomplete (state propagation and CFG merging still use conservative per-block MMU snapshots; path-sensitive MMU evolution remains to be implemented).
 - Runtime C implementation (`runtime/src/gbrt.c`, `runtime/src/interpreter.c`) still contains substantial GB-specific behavior.
 - C emitter dispatch still needs MMU-sensitive function identity and call target resolution.
 - Full Ninja build/test validation still pending on a local filesystem checkout.

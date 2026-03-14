@@ -258,12 +258,18 @@ IRInstruction IRInstruction::make_comment(const std::string& text) {
  * Program methods
  * ========================================================================== */
 
-uint32_t Program::create_block(uint8_t bank, uint16_t addr) {
+uint32_t Program::create_block(uint8_t bank, uint16_t addr,
+                               const std::array<uint8_t, 5>& mmu_state) {
     uint32_t id = next_block_id++;
     BasicBlock blk;
     blk.id = id; blk.bank = bank;
+    blk.mmu_state[0] = mmu_state[0];
+    blk.mmu_state[1] = mmu_state[1];
+    blk.mmu_state[2] = mmu_state[2];
+    blk.mmu_state[3] = mmu_state[3];
+    blk.mmu_state[4] = mmu_state[4];
     blk.start_address = blk.end_address = addr;
-    blk.label = make_address_label(bank, addr);
+    blk.label = make_address_label(bank, addr, mmu_state);
     blocks[id] = blk;
     return id;
 }
@@ -285,18 +291,43 @@ std::string Program::get_label_name(uint32_t id) const {
     return (it != labels.end()) ? it->second : "unknown_label";
 }
 
-std::string Program::make_address_label(uint8_t bank, uint16_t addr) const {
+std::string Program::make_address_label(uint8_t bank, uint16_t addr,
+                                        const std::array<uint8_t, 5>& mmu_state) const {
     std::ostringstream ss;
     ss << "loc_" << std::hex << std::setfill('0')
        << std::setw(2) << (int)bank << "_" << std::setw(4) << addr;
+    if (mmu_state[0] != 0xFF) {
+        ss << "_m"
+           << std::setw(2) << (int)mmu_state[0]
+           << std::setw(2) << (int)mmu_state[1]
+           << std::setw(2) << (int)mmu_state[2]
+           << std::setw(2) << (int)mmu_state[3]
+           << std::setw(2) << (int)mmu_state[4];
+    }
     return ss.str();
 }
 
 std::string Program::make_function_name(uint8_t bank, uint16_t addr) const {
+    for (const auto& [name, fn] : functions) {
+        if (fn.bank == bank && fn.entry_address == addr) {
+            return name;
+        }
+    }
+
     std::ostringstream ss;
     ss << "func_" << std::hex << std::setfill('0')
        << std::setw(2) << (int)bank << "_" << std::setw(4) << addr;
     return ss.str();
+}
+
+std::string Program::make_function_name(uint8_t bank, uint16_t addr,
+                                        const std::array<uint8_t, 5>& mmu_state) const {
+    for (const auto& [name, fn] : functions) {
+        if (fn.bank == bank && fn.entry_address == addr && fn.mmu_state == mmu_state) {
+            return name;
+        }
+    }
+    return make_function_name(bank, addr);
 }
 
 /* ============================================================================
@@ -324,18 +355,24 @@ Program IRBuilder::build(const AnalysisResult& analysis, const std::string& rom_
         ir_func.name          = func.name;
         ir_func.bank          = func.bank;
         ir_func.entry_address = func.entry_address;
+        ir_func.mmu_state     = func.mmu_state;
+        ir_func.context_key   = func.context_key;
         ir_func.is_interrupt_handler = func.is_interrupt_handler;
 
-        for (uint16_t blk_addr : func.block_addresses) {
-            uint32_t full = (static_cast<uint32_t>(func.bank) << 16) | blk_addr;
-            auto it = analysis.blocks.find(full);
+        for (uint64_t blk_key : func.block_addresses) {
+            auto it = analysis.blocks.find(blk_key);
             if (it == analysis.blocks.end()) continue;
 
             const gbrecomp::BasicBlock& src_blk = it->second;
-            uint32_t bid = prog.create_block(func.bank, blk_addr);
+            uint32_t bid = prog.create_block(func.bank, src_blk.start_address, src_blk.mmu_state);
             ir_func.block_ids.push_back(bid);
             ir::BasicBlock& dst_blk = prog.blocks[bid];
             dst_blk.end_address = src_blk.end_address;
+            dst_blk.mmu_state[0] = src_blk.mmu_state[0];
+            dst_blk.mmu_state[1] = src_blk.mmu_state[1];
+            dst_blk.mmu_state[2] = src_blk.mmu_state[2];
+            dst_blk.mmu_state[3] = src_blk.mmu_state[3];
+            dst_blk.mmu_state[4] = src_blk.mmu_state[4];
 
             for (size_t idx : src_blk.instruction_indices) {
                 if (idx < analysis.instructions.size()) {
