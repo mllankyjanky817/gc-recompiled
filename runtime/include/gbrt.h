@@ -1,9 +1,9 @@
 /**
  * @file gbrt.h
- * @brief GameBoy Runtime Library
+ * @brief game.com Runtime Library
  * 
  * This runtime library provides the execution environment for recompiled
- * GameBoy games. It implements memory access, CPU context, and hardware
+ * game.com programs. It implements memory access, CPU context, and hardware
  * emulation needed by the generated C code.
  */
 
@@ -22,13 +22,20 @@ extern "C" {
  * ========================================================================== */
 
 /**
- * @brief GameBoy model selection
+ * @brief Legacy GameBoy model selection (compatibility)
  */
 typedef enum {
     GB_MODEL_DMG,   /**< Original GameBoy (DMG) */
     GB_MODEL_CGB,   /**< GameBoy Color (CGB) */
     GB_MODEL_SGB,   /**< Super GameBoy */
 } GBModel;
+
+/**
+ * @brief game.com model selection
+ */
+typedef enum {
+    GC_MODEL_GAMECOM,
+} GCModel;
 
 /**
  * @brief Runtime configuration
@@ -40,6 +47,16 @@ typedef struct {
     bool enable_serial;
     uint32_t speed_percent; /**< 100 = normal, 200 = 2x, etc */
 } GBConfig;
+
+/**
+ * @brief Runtime configuration for game.com execution
+ */
+typedef struct {
+    GCModel model;
+    bool enable_audio;
+    bool enable_serial;
+    uint32_t speed_percent;
+} GCConfig;
 
 /* ============================================================================
  * Debugging
@@ -57,20 +74,20 @@ extern uint64_t gbrt_instruction_limit;
 /**
  * @brief Forward declaration
  */
-typedef struct GBContext GBContext;
+typedef struct SM85Context SM85Context;
 
 /**
  * @brief Platform callbacks for I/O and rendering
  */
 typedef struct {
-    void (*on_vblank)(GBContext* ctx, const uint8_t* framebuffer);
-    void (*on_audio_sample)(GBContext* ctx, int16_t left, int16_t right);
-    uint8_t (*get_joypad)(GBContext* ctx);
-    void (*on_serial_byte)(GBContext* ctx, uint8_t byte);
+    void (*on_vblank)(SM85Context* ctx, const uint8_t* framebuffer);
+    void (*on_audio_sample)(SM85Context* ctx, int16_t left, int16_t right);
+    uint8_t (*get_joypad)(SM85Context* ctx);
+    void (*on_serial_byte)(SM85Context* ctx, uint8_t byte);
     
     /* Save Data / External RAM */
-    bool (*load_battery_ram)(GBContext* ctx, const char* rom_name, void* data, size_t size);
-    bool (*save_battery_ram)(GBContext* ctx, const char* rom_name, const void* data, size_t size);
+    bool (*load_battery_ram)(SM85Context* ctx, const char* rom_name, void* data, size_t size);
+    bool (*save_battery_ram)(SM85Context* ctx, const char* rom_name, const void* data, size_t size);
 } GBPlatformCallbacks;
 
 /**
@@ -79,7 +96,12 @@ typedef struct {
  * This structure is passed to all recompiled functions and contains
  * the current state of the emulated CPU.
  */
-typedef struct GBContext {
+typedef struct SM85Context {
+    /* SM85 register-file model (game.com) */
+    uint8_t r[16];
+    uint8_t ps0;
+    uint8_t ps1;
+
     /* 8-bit registers */
     union {
         struct { uint8_t f, a; };  /**< AF register pair (little-endian) */
@@ -182,7 +204,11 @@ typedef struct GBContext {
     /* Trace context */
     void* trace_file;     /**< FILE* for trace output */
     bool trace_entries_enabled;
-} GBContext;
+} SM85Context;
+
+/* Backward-compatible aliases during migration */
+typedef SM85Context GBContext;
+typedef GCConfig SM85Config;
 
 /* ============================================================================
  * Context Management

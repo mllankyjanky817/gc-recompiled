@@ -67,171 +67,31 @@ const Function* AnalysisResult::get_function(uint8_t bank, uint16_t addr) const 
  * RST Pattern Detection
  * ========================================================================== */
 
-/**
- * @brief Check if a RST vector contains only 0xFF padding (not real code)
- * 
- * Many ROMs have 0xFF padding at unused RST vector locations.
- * This prevents infinite recursion when analyzing these vectors.
- * 
- * @param rom The ROM to check
- * @param vector The RST vector address (0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38)
- * @return true if the vector contains only 0xFF bytes
- */
-static bool is_rst_padding(const ROM& rom, uint16_t vector) {
-    // RST vectors are 8 bytes apart, check all bytes up to the next vector
-    uint16_t end = vector + 8;
-    if (end > 0x40) end = 0x40;  // Don't go past RST 38 region
-    
-    for (uint16_t addr = vector; addr < end; addr++) {
-        if (rom.read_banked(0, addr) != 0xFF) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/**
- * @brief Check if RST 28 is a jump table dispatcher
- * 
- * Tetris and many other GB games use RST 28 as a computed jump table:
- *   ADD A,A       ; Double A (table entries are 2 bytes)
- *   POP HL        ; Get return address (points to table)
- *   ...
- *   JP (HL)       ; Jump to looked-up address
- * 
- * The bytes following RST 28 calls are table data, NOT code.
- */
-static bool is_rst28_jump_table(const ROM& rom) {
-    // Check for the pattern starting at 0x28:
-    // 87 E1 ... E9 (ADD A,A; POP HL; ...; JP (HL))
-    if (rom.read_banked(0, 0x28) == 0x87 &&  // ADD A,A
-        rom.read_banked(0, 0x29) == 0xE1) {  // POP HL
-        // Look for JP (HL) = 0xE9 somewhere in 0x28-0x3F region
-        for (uint16_t addr = 0x2A; addr < 0x40; addr++) {
-            if (rom.read_banked(0, addr) == 0xE9) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/**
- * @brief Check if RST 28 falls through into RST 30
- * 
- * When RST 28 is a jump table dispatcher, it typically continues through
- * RST 30's space to reach JP (HL). In this case, RST 30 should NOT be
- * marked as a separate function entry since it's part of RST 28's routine.
- * 
- * Pattern: RST 28 at 0x28-0x2F falls through to code at 0x30-0x33 ending with JP (HL)
- */
-static bool rst28_uses_rst30(const ROM& rom) {
-    if (!is_rst28_jump_table(rom)) {
-        return false;
-    }
-    
-    // Check if JP (HL) (0xE9) is in the 0x30-0x37 range (RST 30 region)
-    for (uint16_t addr = 0x30; addr < 0x38; addr++) {
-        if (rom.read_banked(0, addr) == 0xE9) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/**
- * @brief Extract jump table entries following an RST 28 call site
- * 
- * When RST 28 is a jump table dispatcher, the bytes immediately following
- * the RST 28 opcode are 16-bit addresses (in little-endian format).
- * 
- * Pattern from Tetris:
- *   ldh  a,(0cdh)     ; Load index value
- *   rst  28h          ; Call jump table dispatcher (opcode 0xEF)
- *   .dw  l0078        ; Entry 0
- *   .dw  l009f        ; Entry 1
- *   ...
- * 
- * @param rom The ROM to read from
- * @param rst_call_addr Address of the RST 28 opcode (0xEF)
- * @param bank Bank number for the call site
- * @return Vector of extracted jump table target addresses
- */
-static std::vector<uint16_t> extract_rst28_table_entries(const ROM& rom, uint16_t rst_call_addr, uint8_t bank) {
-    std::vector<uint16_t> targets;
-    
-    // Table starts immediately after the RST 28 opcode (1 byte)
-    uint16_t table_start = rst_call_addr + 1;
-    
-    // We don't know the table size statically.
-    // Heuristic: Read addresses until we hit:
-    // 1. An address that's clearly not code (below 0x0100 except for RST vectors)
-    // 2. An address that overlaps with known code
-    // 3. An unreasonably large number of entries (e.g., > 64)
-    // 4. An address at or past 0x8000 (not ROM)
-    
-    const int MAX_TABLE_ENTRIES = 64;  // Tetris has up to 44 entries in its main state machine
-    
-    for (int i = 0; i < MAX_TABLE_ENTRIES; i++) {
-        uint16_t entry_addr = table_start + i * 2;
-        
-        // Make sure we can read 2 bytes
-        size_t rom_offset;
-        if (entry_addr < 0x4000) {
-            rom_offset = entry_addr;
-        } else {
-            rom_offset = static_cast<size_t>(bank) * 0x4000 + (entry_addr - 0x4000);
-        }
-        
-        if (rom_offset + 1 >= rom.size()) {
-            break;  // Past end of ROM
-        }
-        
-        // Read 16-bit address (little-endian)
-        // For addresses in bank 0 region (< 0x4000), always use bank 0
-        uint8_t read_bank = (entry_addr < 0x4000) ? 0 : bank;
-        uint8_t lo = rom.read_banked(read_bank, entry_addr);
-        uint8_t hi = rom.read_banked(read_bank, entry_addr + 1);
-        uint16_t target = static_cast<uint16_t>(lo) | (static_cast<uint16_t>(hi) << 8);
-        
-        // Validate the target address
-        if (target >= 0x8000) {
-            // Not ROM - likely end of table
-            break;
-        }
-        
-        // Address should be aligned to reasonable code
-        // Very low addresses (0x00-0x3F) are RST/INT vectors, which is OK
-        // Addresses 0x40-0xFF should be valid only for known interrupt handlers
-        // Core code typically starts at 0x100+
-        if (target == 0x0000 || target == 0xFFFF) {
-            // Invalid entry, likely end of table
-            break;
-        }
-        
-        // Add the target if it looks valid
-        targets.push_back(target);
-    }
-    
-    return targets;
-}
-
 /* ============================================================================
  * Internal State Tracking
  * ========================================================================== */
 
 // Track addresses to explore: (addr, known_a, ..., current_bank_context)
+// Track addresses to explore with per-path register constant state
 struct AnalysisState {
     uint32_t addr;
-    int known_a;  // -1 if unknown
-    int known_b;
-    int known_c;
-    int known_d;
-    int known_e;
-    int known_h;
-    int known_l;
-    uint8_t current_bank;
+    int known_r[16];   // known value of r0-r15 (-1 = unknown)
+    uint8_t mmu[5];    // MMU window state (windows 0-4 map 0x1000-0x9FFF)
 };
+
+static AnalysisState make_state(uint32_t addr) {
+    AnalysisState s;
+    s.addr = addr;
+    for (int i = 0; i < 16; i++) s.known_r[i] = -1;
+    for (int i = 0; i < 5;  i++) s.mmu[i] = static_cast<uint8_t>(i); // identity mapping
+    return s;
+}
+
+static AnalysisState copy_state_with_addr(const AnalysisState& src, uint32_t addr) {
+    AnalysisState s = src;
+    s.addr = addr;
+    return s;
+}
 
 /* ============================================================================
  * Bank Switch Detection
@@ -243,14 +103,18 @@ struct AnalysisState {
  * Looks for patterns like:
  *   LD A, n      ; n is bank number
  *   LD (2000), A ; or LD (2100), A, etc.
+  *   LD r0, n      ; n is bank number
+  *   LD (0024), r0 ; or through any MMU window register 0x0024-0x0028
  */
 static std::set<uint8_t> detect_bank_values(const ROM& rom) {
     std::set<uint8_t> banks;
-    uint16_t bank_count = rom.header().rom_banks;
-    for (uint16_t i = 0; i < bank_count && i < 256; i++) {
+    // Enumerate banks that appear as literal LD_R_IMM / LD_DIR_R pairs targeting
+    // MMU window registers 0x0024-0x0028.  Fallback: all banks present in ROM.
+    const size_t bank_size = arch::GC_ROM_WINDOW_SIZE;
+    const size_t nbanks = (rom.size() + bank_size - 1) / bank_size;
+    for (size_t i = 0; i < nbanks && i < 256; i++) {
         banks.insert(static_cast<uint8_t>(i));
     }
-    
     return banks;
 }
 
@@ -330,11 +194,11 @@ static int is_likely_valid_code(const ROM& rom, uint8_t bank, uint16_t addr) {
         }
         
         // 4. Illegal address check
-        if (instr.type == InstructionType::LD_A_NN || instr.type == InstructionType::LD_NN_A ||
-            instr.type == InstructionType::LD_NN_SP || instr.type == InstructionType::LD_RR_NN ||
+        if (instr.type == InstructionType::LD_R_DIR || instr.type == InstructionType::LD_DIR_R ||
+            instr.type == InstructionType::LDW_RR_NN ||
             instr.is_call || instr.is_jump) {
             
-            uint16_t imm = (instr.type == InstructionType::JR_N || instr.type == InstructionType::JR_CC_N) ? 0 : instr.imm16;
+            uint16_t imm = (instr.type == InstructionType::JR_E || instr.type == InstructionType::JRC_CC_E) ? 0 : instr.imm16;
             if (imm != 0) {
                 if (imm >= arch::GC_VRAM_START && imm < arch::GC_EXT_RAM_END) return 0;
             }
@@ -343,20 +207,11 @@ static int is_likely_valid_code(const ROM& rom, uint8_t bank, uint16_t addr) {
         if (instr.reads_memory || instr.writes_memory) ld_count++;
         if (instr.is_call || instr.is_jump || instr.is_return) control_flow_count++;
         
-        // Math/Logic
-        if (instr.opcode >= 0x80 && instr.opcode <= 0xBF) math_count++;
+            // Math/Logic (SM85CPU ALU opcodes 0x80-0xBF, shifts 0xB0-0xB6)
+            if ((instr.opcode >= 0x80 && instr.opcode <= 0xBF)) math_count++;
 
         // Reject rare/data-like opcodes if too frequent at start
-        if (instr.opcode == 0x27 || instr.opcode == 0x2F || instr.opcode == 0x37 || instr.opcode == 0x3F) {
-            if (instructions_checked < 4) return 0;
-        }
-        
-        // RST instructions in data are suspicious (0x00 or 0xFF)
-        if (instr.type == InstructionType::RST) {
-            if (instr.opcode == 0xC7 || instr.opcode == 0xFF) {
-                 if (instructions_checked < 2) return 0;
-            }
-        }
+        // No SM85CPU-specific opcode heuristics needed here
 
         // Terminator Check
         if (instr.is_return && !instr.is_conditional) {
@@ -397,7 +252,7 @@ static void find_pointer_entry_points(const ROM& rom, AnalysisResult& result, st
                 uint32_t full_addr = make_address(tbank, target);
                 if (result.call_targets.find(full_addr) == result.call_targets.end()) {
                     result.call_targets.insert(full_addr);
-                    work_queue.push({full_addr, -1, -1, -1, -1, -1, -1, -1, tbank});
+                    work_queue.push(make_state(full_addr));
                 }
             }
         }
@@ -470,16 +325,14 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
 
     // Initial work queue seeding
     for (uint32_t target : result.call_targets) {
-        uint8_t bank = get_bank(target);
-        work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, bank});
+        work_queue.push(make_state(target));
     }
     
     // Manual entry points
     for (uint32_t target : options.entry_points) {
         if (result.call_targets.find(target) == result.call_targets.end()) {
             result.call_targets.insert(target);
-            uint8_t bank = get_bank(target);
-            work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, bank});
+            work_queue.push(make_state(target));
         }
     }
 
@@ -487,7 +340,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         std::cerr << "Analyzing all " << known_banks.size() << " banks\n";
         for (uint8_t bank : known_banks) {
             if (is_likely_valid_code(rom, bank, arch::GC_ROM_WINDOW_START)) {
-                work_queue.push({make_address(bank, arch::GC_ROM_WINDOW_START), -1, -1, -1, -1, -1, -1, -1, bank});
+                work_queue.push(make_state(make_address(bank, arch::GC_ROM_WINDOW_START)));
                 result.call_targets.insert(make_address(bank, arch::GC_ROM_WINDOW_START));
             }
         }
@@ -497,14 +350,13 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     for (const auto& ov : options.ram_overlays) {
         uint32_t addr = make_address(0, ov.ram_addr);
         result.call_targets.insert(addr);
-        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, 0});
+        work_queue.push(make_state(addr));
     }
 
     // Add manual entry points
     for (uint32_t addr : options.entry_points) {
         result.call_targets.insert(addr);
-        uint8_t bank = get_bank(addr);
-        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, bank});
+        work_queue.push(make_state(addr));
     }
     
     // Multi-pass analysis
@@ -518,14 +370,12 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         work_queue.pop();
         
         uint32_t addr = item.addr;
-        int known_a = item.known_a;
-        int known_b = item.known_b;
-        int known_c = item.known_c;
-        int known_d = item.known_d;
-        int known_e = item.known_e;
-        int known_h = item.known_h;
-        int known_l = item.known_l;
-        uint8_t current_switchable_bank = item.current_bank;
+        int known_r[16];
+        uint8_t current_mmu[5];
+        for (int i = 0; i < 16; i++) known_r[i] = item.known_r[i];
+        for (int i = 0; i < 5;  i++) current_mmu[i] = item.mmu[i];
+        // current_switchable_bank: derive from MMU window 0 (maps 0x1000-0x2FFF)
+        uint8_t current_switchable_bank = current_mmu[0];
         
         if (visited.count(addr)) continue;
         
@@ -544,8 +394,6 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         if (!rom.is_visible_rom_address(offset) && !overlay) continue;
         if (overlay && visited.count(addr)) continue;
 
-        current_switchable_bank = bank;
-        
         // Calculate ROM offset
         size_t rom_offset;
         if (overlay) {
@@ -575,85 +423,45 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         /* -------------------------------------------------------------
          * Constant Propagation (A and HL)
          * ------------------------------------------------------------- */
-         
-        // Helper to get combined HL
-        auto get_known_hl = [&]() -> int {
-            if (known_h != -1 && known_l != -1) return (known_h << 8) | known_l;
-            return -1;
-        };
 
-        // Helper to get combined registers
-        auto get_known_bc = [&]() -> int { if (known_b != -1 && known_c != -1) return (known_b << 8) | known_c; return -1; };
-        auto get_known_de = [&]() -> int { if (known_d != -1 && known_e != -1) return (known_d << 8) | known_e; return -1; };
-
-        // 8-bit Loads
-        if (instr.opcode == 0x06) known_b = instr.imm8;
-        else if (instr.opcode == 0x0E) known_c = instr.imm8;
-        else if (instr.opcode == 0x16) known_d = instr.imm8;
-        else if (instr.opcode == 0x1E) known_e = instr.imm8;
-        else if (instr.opcode == 0x26) known_h = instr.imm8;
-        else if (instr.opcode == 0x2E) known_l = instr.imm8;
-        else if (instr.opcode == 0x3E) known_a = instr.imm8;
-        // 16-bit Loads
-        else if (instr.opcode == 0x01) { known_b = (instr.imm16 >> 8); known_c = instr.imm16 & 0xFF; }
-        else if (instr.opcode == 0x11) { known_d = (instr.imm16 >> 8); known_e = instr.imm16 & 0xFF; }
-        else if (instr.opcode == 0x21) { known_h = (instr.imm16 >> 8); known_l = instr.imm16 & 0xFF; }
-        // LD r, r'
-        else if (instr.opcode >= 0x40 && instr.opcode <= 0x7F && instr.opcode != 0x76) {
-            int* regs[] = {&known_b, &known_c, &known_d, &known_e, &known_h, &known_l, nullptr, &known_a};
-            int dst = (instr.opcode >> 3) & 7;
-            int src = instr.opcode & 7;
-            if (regs[dst]) {
-                if (src == 6) { // LD r, (HL)
-                    int mhl = get_known_hl();
-                    if (mhl != -1 && rom.is_visible_rom_address(static_cast<uint16_t>(mhl))) {
-                        *regs[dst] = rom.read_banked(bank, static_cast<uint16_t>(mhl));
-                    }
-                    else *regs[dst] = -1;
-                } else if (regs[src]) *regs[dst] = *regs[src];
-                else *regs[dst] = -1;
-            } else if (dst == 6) { // LD (HL), r
-                 // Memory write - conceptually invalidates ROM values if we were tracking them, 
-                 // but we only track constant ROM.
-            }
+        // SM85CPU: LD rN, imm -> track known_r[N]
+        if (instr.type == InstructionType::LD_R_IMM) {
+            known_r[instr.reg8_dst] = instr.imm8;
         }
-        else if (instr.opcode == 0xAF) known_a = 0; // XOR A
-        // ADD HL, rr
-        else if (instr.opcode == 0x09 || instr.opcode == 0x19 || instr.opcode == 0x29) {
-            int val = -1;
-            if (instr.opcode == 0x09) val = get_known_bc();
-            if (instr.opcode == 0x19) val = get_known_de();
-            if (instr.opcode == 0x29) val = get_known_hl();
-            int mhl = get_known_hl();
-            if (mhl != -1 && val != -1) {
-                int res = (mhl + val) & 0xFFFF;
-                known_h = (res >> 8); known_l = res & 0xFF;
-            } else { known_h = -1; known_l = -1; }
+        // SM85CPU: LD rD, rS -> propagate source value
+        else if (instr.type == InstructionType::LD_R_R) {
+            known_r[instr.reg8_dst] = known_r[instr.reg8_src];
         }
-        // Invalidate A on ALU
-        else if ((instr.opcode >= 0x80 && instr.opcode <= 0xBF) || (instr.opcode & 0xC7) == 0x06 || instr.opcode == 0x3C || instr.opcode == 0x3D) {
-            known_a = -1;
+        // All ALU / POP / indirect loads invalidate the destination register
+        else if (instr.type == InstructionType::ADD_R_R  || instr.type == InstructionType::ADDC_R_R  ||
+                 instr.type == InstructionType::SUB_R_R  || instr.type == InstructionType::SUBC_R_R  ||
+                 instr.type == InstructionType::AND_R_R  || instr.type == InstructionType::OR_R_R    ||
+                 instr.type == InstructionType::XOR_R_R  || instr.type == InstructionType::ADD_R_IMM ||
+                 instr.type == InstructionType::ADDC_R_IMM || instr.type == InstructionType::SUB_R_IMM ||
+                 instr.type == InstructionType::SUBC_R_IMM || instr.type == InstructionType::AND_R_IMM ||
+                 instr.type == InstructionType::OR_R_IMM  || instr.type == InstructionType::XOR_R_IMM ||
+                 instr.type == InstructionType::INC_R    || instr.type == InstructionType::DEC_R     ||
+                 instr.type == InstructionType::LD_R_IND || instr.type == InstructionType::LD_R_IDX  ||
+                 instr.type == InstructionType::LD_R_DIR || instr.type == InstructionType::POP_RR) {
+            if (instr.reg8_dst < 16) known_r[instr.reg8_dst] = -1;
         }
-        // POPs
-        else if (instr.opcode == 0xC1) { known_b = -1; known_c = -1; }
-        else if (instr.opcode == 0xD1) { known_d = -1; known_e = -1; }
-        else if (instr.opcode == 0xE1) { known_h = -1; known_l = -1; }
-        else if (instr.opcode == 0xF1) { known_a = -1; }
 
         /* -------------------------------------------------------------
          * Bank Switching Detection
          * ------------------------------------------------------------- */
-        if (instr.opcode == 0xEA) { // LD (nn), A
-            if (instr.imm16 >= 0x2000 && instr.imm16 <= 0x3FFF) {
-                bool is_dynamic = (known_a == -1);
-                uint8_t target_b = is_dynamic ? 1 : (known_a == 0 ? 1 : known_a);
-                target_b &= 0xFF;
-                
-                result.bank_tracker.record_bank_switch(addr, target_b, is_dynamic);
-                
-                if (!is_dynamic) {
-                    current_switchable_bank = target_b;
-                }
+        // SM85CPU: LD (nn), rN where nn is 0x0024-0x0028 = MMU window write
+        if (instr.type == InstructionType::LD_DIR_R &&
+            instr.imm16 >= 0x0024 && instr.imm16 <= 0x0028) {
+            uint8_t win     = static_cast<uint8_t>(instr.imm16 - 0x0024);
+            uint8_t src_reg = instr.reg8_src;
+            bool is_dynamic = (src_reg >= 16 || known_r[src_reg] == -1);
+            uint8_t new_bank = is_dynamic ? 1 : static_cast<uint8_t>(known_r[src_reg]);
+
+            result.bank_tracker.record_bank_switch(addr, new_bank, is_dynamic);
+
+            if (!is_dynamic) {
+                current_mmu[win] = new_bank;
+                current_switchable_bank = current_mmu[0];
             }
         }
 
@@ -684,37 +492,17 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         size_t idx = result.instructions.size();
         result.instructions.push_back(instr);
         result.addr_to_index[addr] = idx;
+
+        AnalysisState base_state = item;
+        for (int i = 0; i < 16; i++) base_state.known_r[i] = known_r[i];
+        for (int i = 0; i < 5;  i++) base_state.mmu[i] = current_mmu[i];
         
         auto target_bank = [&](uint16_t target) -> uint8_t {
             if (!rom.is_visible_rom_address(target)) return 0;
             return current_switchable_bank;
         };
-        
-        if (instr.type == InstructionType::RST) {
-            if (is_rst_padding(rom, instr.rst_vector)) continue;
-            
-            result.call_targets.insert(make_address(0, instr.rst_vector));
-            work_queue.push({make_address(0, instr.rst_vector), -1, -1, -1, -1, -1, -1, -1, 1});
-            
-            bool is_rst28_jt = (instr.rst_vector == 0x28 && is_rst28_jump_table(rom));
-            if (is_rst28_jt) {
-                std::vector<uint16_t> table_targets = extract_rst28_table_entries(rom, offset, bank);
-                for (uint16_t target : table_targets) {
-                    uint8_t tbank = (target < 0x4000) ? 0 : bank;
-                    if (tbank == 0 && target >= 0x4000) tbank = 1;
 
-                    if (is_likely_valid_code(rom, tbank, target)) {
-                        result.call_targets.insert(make_address(tbank, target));
-                        work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, tbank});
-                        result.label_addresses.insert(make_address(tbank, target));
-                    }
-                }
-            } else {
-                uint32_t fall_through = make_address(bank, offset + instr.length);
-                result.label_addresses.insert(fall_through);
-                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
-            }
-        } else if (instr.is_call) {
+        if (instr.is_call) {
             uint16_t target = instr.imm16;
             uint8_t tbank = target_bank(target);
             instr.resolved_target_bank = tbank;
@@ -724,7 +512,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             }
 
             result.call_targets.insert(make_address(tbank, target));
-            work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, tbank});
+            work_queue.push(make_state(make_address(tbank, target)));
             
             if (tbank != bank) {
                 result.stats.cross_bank_calls++;
@@ -733,9 +521,9 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             
             uint32_t fall_through = make_address(bank, offset + instr.length);
             result.label_addresses.insert(fall_through);
-            work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+            work_queue.push(copy_state_with_addr(base_state, fall_through));
         } else if (instr.is_jump) {
-            if (instr.type == InstructionType::JP_NN || instr.type == InstructionType::JP_CC_NN) {
+            if (instr.type == InstructionType::JP_NN || instr.type == InstructionType::JPC_CC_NN) {
                 uint16_t target = instr.imm16;
                 uint8_t tbank = target_bank(target);
                 instr.resolved_target_bank = tbank;
@@ -746,65 +534,30 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                     result.call_targets.insert(make_address(tbank, target));
                 }
                 result.label_addresses.insert(make_address(tbank, target));
-                work_queue.push({make_address(tbank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, tbank});
-            } else if (instr.type == InstructionType::JR_N || instr.type == InstructionType::JR_CC_N) {
+                work_queue.push(copy_state_with_addr(base_state, make_address(tbank, target)));
+            } else if (instr.type == InstructionType::JR_E || instr.type == InstructionType::JRC_CC_E ||
+                       instr.type == InstructionType::DBNZ_R_E) {
                 uint16_t target = offset + instr.length + instr.offset;
                 result.label_addresses.insert(make_address(bank, target));
-                work_queue.push({make_address(bank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
-            } else if (instr.type == InstructionType::JP_HL) {
-                int combined_hl = get_known_hl();
-                if (combined_hl != -1) {
-                    uint16_t target = (uint16_t)combined_hl;
-                    uint8_t tbank = target_bank(target);
-                    std::cout << "[ANALYSIS] Resolved static JP HL at " << std::hex << (int)bank << ":" << offset << " -> " << (int)tbank << ":" << target << std::dec << "\n";
-                    result.call_targets.insert(make_address(tbank, target));
-                    result.label_addresses.insert(make_address(tbank, target));
-                    work_queue.push({make_address(tbank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, tbank});
-                } else {
-                    // Backtracking Jump Table Heuristic
-                    bool found_table = false;
-                    // Scan back for 'LD H, imm' pattern (very common for tables)
-                    for (int back = 1; back < 10; back++) {
-                        if (offset < back) break;
-                        uint8_t op = rom.read_banked(bank, offset - back);
-                        if (op == 0x26) { // LD H, imm
-                            uint8_t table_h = rom.read_banked(bank, offset - back + 1);
-                            std::cout << "[ANALYSIS] Heuristic: Found potential jump table at " << std::hex << (int)table_h << "00 near " << (int)bank << ":" << offset << std::dec << "\n";
-                            // Scan the page for addresses that lead to code
-                            for (int i = 0; i < 256; i += 2) {
-                                uint16_t entry_addr = (table_h << 8) | i;
-                                uint8_t lo = rom.read(entry_addr);
-                                uint8_t hi = rom.read(entry_addr + 1);
-                                uint16_t target = lo | (hi << 8);
-                                if (rom.is_visible_rom_address(target)) {
-                                    uint8_t tbank = target_bank(target);
-                                    if (is_likely_valid_code(rom, tbank, target)) {
-                                        result.call_targets.insert(make_address(tbank, target));
-                                        work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, tbank});
-                                        found_table = true;
-                                    }
-                                }
-                            }
-                            if (found_table) break;
-                        }
-                    }
-                    if (!found_table) std::cout << "[ANALYSIS] Unresolved JP HL at " << std::hex << (int)bank << ":" << offset << std::dec << "\n";
-                }
+                work_queue.push(copy_state_with_addr(base_state, make_address(bank, target)));
+            } else if (instr.type == InstructionType::JP_RR) {
+                // Indirect jump target unknown at analysis time.
+                result.computed_jump_targets.insert(make_address(bank, offset));
             }
             
             if (instr.is_conditional) {
                 uint32_t fall_through = make_address(bank, offset + instr.length);
                 result.label_addresses.insert(fall_through);
-                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+                work_queue.push(copy_state_with_addr(base_state, fall_through));
             }
         } else if (instr.is_return) {
             if (instr.is_conditional) {
                 uint32_t fall_through = make_address(bank, offset + instr.length);
                 result.label_addresses.insert(fall_through);
-                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+                work_queue.push(copy_state_with_addr(base_state, fall_through));
             }
         } else {
-            work_queue.push({make_address(bank, offset + instr.length), known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+            work_queue.push(copy_state_with_addr(base_state, make_address(bank, offset + instr.length)));
         }
     } // End work_queue loop
 
@@ -859,7 +612,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                     result.call_targets.insert(entry);
                     
                     // Add to queue
-                    work_queue.push({entry, -1, -1, -1, -1, -1, -1, -1, bank});
+                    work_queue.push(make_state(entry));
                     found_count++;
                     
                     // Mark region as scanned
@@ -924,9 +677,10 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             
             // Track successors for control flow
             if (instr.is_jump) {
-                if (instr.type == InstructionType::JP_NN || instr.type == InstructionType::JP_CC_NN) {
+                if (instr.type == InstructionType::JP_NN || instr.type == InstructionType::JPC_CC_NN) {
                     block.successors.push_back(instr.imm16);
-                } else if (instr.type == InstructionType::JR_N || instr.type == InstructionType::JR_CC_N) {
+                } else if (instr.type == InstructionType::JR_E || instr.type == InstructionType::JRC_CC_E ||
+                           instr.type == InstructionType::DBNZ_R_E) {
                     uint16_t target = get_offset(curr) + instr.length + instr.offset;
                     block.successors.push_back(target);
                 }

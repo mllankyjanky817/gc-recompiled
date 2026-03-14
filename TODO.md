@@ -13,6 +13,25 @@ Completed in the last session:
 
 Important: this is not yet a working game.com recompiler/runtime. The largest blockers are still open below.
 
+## Session Progress Update
+
+Completed in this session:
+
+- Replaced `recompiler/include/recompiler/decoder.h` with an SM85CPU-oriented instruction/register model.
+- Replaced `recompiler/src/decoder.cpp` with an SM85CPU opcode decoder/disassembler baseline.
+- Reworked `recompiler/include/recompiler/ir/ir.h` around SM85 semantics and MMU-aware IR operands.
+- Replaced `recompiler/include/recompiler/ir/ir_builder.h` and `recompiler/src/ir/ir_builder.cpp` to lower the new SM85 instruction families.
+- Removed legacy GB `RST` pattern logic from `recompiler/src/analyzer.cpp` and switched analysis queue state to `known_r[16] + mmu[5]`.
+- Updated jump/call analysis paths to use new SM85 instruction names (`JPC_CC_NN`, `JR_E`, `JRC_CC_E`, `DBNZ_R_E`, `JP_RR`).
+- Began runtime header migration in `runtime/include/gbrt.h` by introducing `SM85Context` and game.com config/model types while keeping compatibility aliases.
+
+Still remaining after this session:
+
+- Deep analyzer/MMU identity work is still incomplete (function identity is still bank/address keyed, not full MMU-state keyed).
+- Runtime C implementation (`runtime/src/gbrt.c`, `runtime/src/interpreter.c`) still contains substantial GB-specific behavior.
+- C emitter dispatch still needs MMU-sensitive function identity and call target resolution.
+- Full Ninja build/test validation still pending on a local filesystem checkout.
+
 ## Highest Priority
 
 ### 1. Replace the SM83 decoder with an SM85CPU decoder

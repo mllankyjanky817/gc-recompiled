@@ -1,6 +1,6 @@
 /**
  * @file ir_builder.h
- * @brief Build IR from decoded SM83 instructions
+ * @brief Build IR from decoded SM85CPU (game.com / SM8521) instructions
  */
 
 #ifndef RECOMPILER_IR_BUILDER_H
@@ -18,57 +18,73 @@ namespace ir {
  * @brief Options for IR building
  */
 struct BuilderOptions {
-    bool emit_source_locations = true;   // Include source address info
-    bool emit_comments = true;           // Include disassembly comments
-    bool preserve_flags_exactly = true;  // Emit exact flag computations
+    bool emit_source_locations  = true;
+    bool emit_comments          = true;
+    bool preserve_flags_exactly = true;
 };
 
 /**
- * @brief Builds IR from analyzed instructions
+ * @brief Builds IR from analyzed SM85CPU instructions.
  */
 class IRBuilder {
 public:
     explicit IRBuilder(const BuilderOptions& options = {});
-    
+
     /**
-     * @brief Build IR program from analysis result
-     * 
-     * @param analysis Analyzed ROM
-     * @param rom_name Name for the program
-     * @return IR program
+     * Build an IR Program from an AnalysisResult.
      */
     Program build(const AnalysisResult& analysis, const std::string& rom_name);
-    
+
     /**
-     * @brief Lower a single instruction to IR
-     * 
-     * @param instr Decoded instruction
-     * @param block Block to append to
+     * Lower a single decoded SM85CPU instruction into an IR BasicBlock.
      */
     void lower_instruction(const Instruction& instr, BasicBlock& block);
 
 private:
     BuilderOptions options_;
-    
-    // Lowering helpers for instruction categories
-    void lower_load_r_r(const Instruction& instr, BasicBlock& block);
-    void lower_load_r_imm(const Instruction& instr, BasicBlock& block);
-    void lower_load_mem(const Instruction& instr, BasicBlock& block);
-    void lower_store_mem(const Instruction& instr, BasicBlock& block);
-    void lower_alu_r(const Instruction& instr, BasicBlock& block);
-    void lower_alu_imm(const Instruction& instr, BasicBlock& block);
-    void lower_inc_dec(const Instruction& instr, BasicBlock& block);
-    void lower_rotate_shift(const Instruction& instr, BasicBlock& block);
-    void lower_bit_op(const Instruction& instr, BasicBlock& block);
-    void lower_jump(const Instruction& instr, BasicBlock& block, Program& prog);
-    void lower_call(const Instruction& instr, BasicBlock& block, Program& prog);
-    void lower_ret(const Instruction& instr, BasicBlock& block);
-    void lower_misc(const Instruction& instr, BasicBlock& block);
-    void lower_io(const Instruction& instr, BasicBlock& block);
-    void lower_16bit_load(const Instruction& instr, BasicBlock& block);
-    void lower_16bit_alu(const Instruction& instr, BasicBlock& block);
-    
-    // Helper to add instruction with source location
+
+    // --- SM85CPU instruction group lowering helpers ---
+
+    // 8-bit data transfer
+    void lower_ld_r_r   (const Instruction&, BasicBlock&);
+    void lower_ld_r_imm (const Instruction&, BasicBlock&);
+    void lower_ld_r_ind (const Instruction&, BasicBlock&);
+    void lower_ld_ind_r (const Instruction&, BasicBlock&);
+    void lower_ld_r_idx (const Instruction&, BasicBlock&);
+    void lower_ld_idx_r (const Instruction&, BasicBlock&);
+    void lower_ld_r_dir (const Instruction&, BasicBlock&);
+    void lower_ld_dir_r (const Instruction&, BasicBlock&);
+
+    // 16-bit data transfer
+    void lower_ldw      (const Instruction&, BasicBlock&);
+    void lower_push_pop (const Instruction&, BasicBlock&);
+
+    // 8-bit ALU
+    void lower_alu8_rr  (const Instruction&, BasicBlock&);
+    void lower_alu8_imm (const Instruction&, BasicBlock&);
+    void lower_inc_dec  (const Instruction&, BasicBlock&);
+    void lower_misc8    (const Instruction&, BasicBlock&);  // CPL, DAA, SWAP
+
+    // 16-bit ALU
+    void lower_inc_dec16(const Instruction&, BasicBlock&);
+    void lower_add_sub16(const Instruction&, BasicBlock&);
+
+    // Multiply / divide
+    void lower_mul_div  (const Instruction&, BasicBlock&);
+
+    // Shift / rotate
+    void lower_shift_rot(const Instruction&, BasicBlock&);
+
+    // Bit operations (BIT / CLR / SET / BBC / BBS)
+    void lower_bit_op   (const Instruction&, BasicBlock&);
+
+    // Control flow
+    void lower_jump     (const Instruction&, BasicBlock&, Program&);
+    void lower_call     (const Instruction&, BasicBlock&, Program&);
+    void lower_ret      (const Instruction&, BasicBlock&);
+    void lower_misc_ctrl(const Instruction&, BasicBlock&);  // DI, EI, HALT, STOP, NOP
+
+    // Emit helper — attaches source location and appends to block
     void emit(BasicBlock& block, IRInstruction instr, const Instruction& src);
 };
 
